@@ -1,0 +1,44 @@
+{
+  "name": "agent-relay-pg",
+  "version": "0.1.0",
+  "description": "Cross-machine Postgres transport plugin for agent-relay (self-contained drop-in).",
+  "type": "module",
+  "main": "index.mjs",
+  "bin": {
+    "agent-relay-pg": "scripts/install.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "env-file.mjs",
+    "transport/",
+    "credentials/",
+    "scripts/install.mjs",
+    "scripts/preflight-cross-machine.mjs"
+  ],
+  "agentRelay": {
+    "entry": "index.mjs"
+  },
+  "license": "MIT",
+  "author": "joniba",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joniba/agent-relay-pg-plugin.git"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": [
+    "copilot-cli",
+    "agent-relay",
+    "plugin",
+    "postgres",
+    "cross-machine"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "pg": "^8.21.0",
+    "@azure/identity": "^4.5.0"
+  }
+}
