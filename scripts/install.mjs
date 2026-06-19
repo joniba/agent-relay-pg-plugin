@@ -49,18 +49,23 @@ const pluginDest = join(coreInstall, "plugins", "agent-relay-pg");
 const binDir = join(pkgRoot, "bin");
 const coreClone = join(binDir, "agent-relay");
 
-/** Run a command, inheriting stdio. On Windows, ONLY the `.cmd` shims (npm/az) need a
- *  shell; node (an absolute path that may contain spaces, e.g. "C:\Program Files\...")
- *  and git.exe must run WITHOUT a shell so spaced paths aren't split. */
-function needsShell(cmd) {
-  return process.platform === "win32" && (cmd === "npm" || cmd === "az");
+/** On Windows, npm/az are `.cmd` shims: they can't be spawned directly (Node refuses to
+ *  run a `.cmd` without a shell) and `shell:true` + an args array is deprecated AND leaves
+ *  the args unescaped (DEP0190). Invoke them through cmd.exe (a real `.exe`) with NO shell
+ *  option, so Node still escapes each arg. node/git run directly — no shell, no shim. */
+function winShim(cmd, args) {
+  return process.platform === "win32" && (cmd === "npm" || cmd === "az")
+    ? ["cmd.exe", ["/d", "/s", "/c", cmd, ...args]]
+    : [cmd, args];
 }
 function run(cmd, args, opts = {}) {
-  execFileSync(cmd, args, { stdio: "inherit", shell: needsShell(cmd), ...opts });
+  const [c, a] = winShim(cmd, args);
+  execFileSync(c, a, { stdio: "inherit", ...opts });
 }
 /** Like run() but returns false instead of throwing (for optional probes). */
 function tryRun(cmd, args, opts = {}) {
-  try { execFileSync(cmd, args, { stdio: "ignore", shell: needsShell(cmd), ...opts }); return true; }
+  const [c, a] = winShim(cmd, args);
+  try { execFileSync(c, a, { stdio: "ignore", ...opts }); return true; }
   catch { return false; }
 }
 
