@@ -93,11 +93,60 @@ The installer copies a strict **runtime allowlist** into the plugin folder — `
 `env-file.mjs`, `transport/`, `credentials/`, `node_modules/` — and nothing else (no `tests/`, `scripts/`,
 or the cloned-core `bin/`).
 
+## Security model
+
+For the **Azure / Entra** path:
+
+- **Microsoft Entra token + TLS is the entire boundary.** Password auth is disabled on the provisioned
+  server; only a valid token for a server admin can connect.
+- **No IP allowlist** — home/office egress IPs rotate, so network location isn't a control. Public
+  network access stays on, gated by authentication.
+- Tokens are acquired **locally per machine**, are not written to the plugin's config or logs, and are
+  never transferred between machines.
+- The four connection values (host, admin user, database name, tenant id) are **not secrets**.
+
+(The local / CI **password** path — `AGENT_RELAY_PG_PASSWORD`, TLS off — is for a throwaway local Docker
+or CI database only, not a shared production mesh.)
+
+## Resilience
+
+If the database can't be reached **at startup**, the transport handles it without a silent fallback to
+the local mesh (that would split your machines onto separate stores without telling you):
+
+- **Transient** failures (offline, not yet `az login`'d) are **retried a few times**; **deterministic**
+  ones (wrong tenant/account, an unsupported newer schema) **fail fast**. Either way, if startup can't
+  complete, the session runs **inactive**.
+- Fix the cause — network, Azure login/tenant, or schema compatibility — and **restart**. Or remove the
+  plugin folder and restart to return to the local SQLite default.
+- A transient **mid-session** blip is ridden out by the receive poll loop (it resumes on the next poll,
+  no fallback); a `send_message` / `list_relay_agents` issued during the blip may just need retrying.
+
+A session-owned, advisory-lock-guarded sweep prunes old messages (> 24 h) and long-gone peers (> 7 d), so
+no always-on cleanup job is needed.
+
 ## Upgrade / uninstall
 
 - **Upgrade:** re-run the install command.
 - **Opt out of cross-machine:** delete `<COPILOT_HOME>/extensions/agent-relay/plugins/agent-relay-pg/` —
   core reverts to the local SQLite default. (Reinstalling core never deletes that folder.)
+
+## Teardown (remove the Azure resources)
+
+To remove just the database server this plugin provisioned (safe even if the resource group holds other
+resources):
+
+```bash
+az postgres flexible-server delete --resource-group rg-agent-relay --name pg-agent-relay-<unique> --yes
+```
+
+Only if `rg-agent-relay` is **dedicated** to this plugin, you can delete the whole group:
+
+```bash
+az group delete --name rg-agent-relay --yes        # deletes EVERYTHING in the group
+```
+
+(Use your actual `-ResourceGroup` / `-ServerName` if you customized them. To stop using cross-machine
+messaging *without* deleting the database, just uninstall the plugin — see above.)
 
 ## Configuration
 
