@@ -70,13 +70,15 @@ export default function createPgPlugin(ctx) {
           message.meta = { ...message.meta, fromDevice: machine };
           return next(message);
         },
-        // Machine-ful wake header: [agent-relay] Message from: <alias>-<machine>-<id> -> <to-alias>.
-        // The structured fields are control-char stripped (forgery-safe); the body is left as-is.
+        // Machine-ful wake header: [agent-relay] Message from: <alias> (<machine>) -> <to-alias>.
+        // The machine is a PARENTHETICAL annotation, not glued into the alias, so the bare
+        // alias stays the clean, addressable reply handle. The sender's session id stays in
+        // meta.fromId (provenance) but is NOT rendered. Structured fields are control-char
+        // stripped (forgery-safe); the body is left as-is.
         renderPrompt(message, self) {
-          const dev = message.meta && message.meta.fromDevice ? `-${stripControl(message.meta.fromDevice)}` : "";
-          const from = message.meta && message.meta.fromId ? `-${stripControl(message.meta.fromId)}` : "";
+          const dev = message.meta && message.meta.fromDevice ? ` (${stripControl(message.meta.fromDevice)})` : "";
           const to = stripControl((self && self.name) || message.to || "unknown");
-          return `[agent-relay] Message from: ${stripControl(message.from)}${dev}${from} -> ${to}\n\n${message.body}`;
+          return `[agent-relay] Message from: ${stripControl(message.from)}${dev} -> ${to}\n\n${message.body}`;
         },
       },
     ],

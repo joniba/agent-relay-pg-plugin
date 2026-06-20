@@ -285,12 +285,22 @@ if (haveConn) {
     preflight();
   }
 } else {
+  const envPath = join(pluginDest, ".env");
   warn(
     "\nNo Postgres connection settings found, so no .env was written and preflight was skipped.\n" +
-    "The plugin is installed but needs AGENT_RELAY_PG_HOST / _USER / _DB. First-time setup:\n" +
-    "  1. provision the database (see scripts/provision-azure.ps1 / the README),\n" +
-    "  2. set AGENT_RELAY_PG_HOST / _USER / _DB (export them or put them in a .env),\n" +
-    "  3. re-run this installer.",
+    "The plugin is installed but needs its connection settings. Two ways to provide them:\n\n" +
+    "  A) Create the plugin's .env file directly (the runtime loads it on startup):\n" +
+    `       ${envPath}\n` +
+    "     with at least:\n" +
+    "       AGENT_RELAY_PG_HOST=your-host\n" +
+    "       AGENT_RELAY_PG_USER=your-user\n" +
+    "       AGENT_RELAY_PG_DB=your-db\n" +
+    "     optional: AGENT_RELAY_PG_PORT (default 5432), AGENT_RELAY_PG_SSL ('false' for local Docker),\n" +
+    "       and EITHER AGENT_RELAY_PG_PASSWORD (local/CI) OR AGENT_RELAY_AZURE_TENANT (Azure Entra auth).\n" +
+    "     Then just start Copilot — no re-install needed (this path skips the connection check).\n\n" +
+    "  B) Export those vars (or set AGENT_RELAY_ENV_FILE=<path-to-your-.env>) and RE-RUN this\n" +
+    "     installer — it writes the .env above for you AND verifies the connection (preflight).\n\n" +
+    "  First time? Provision the database first (see scripts/provision-azure.ps1 / the README).",
   );
 }
 
