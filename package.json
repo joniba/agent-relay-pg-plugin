@@ -4,16 +4,11 @@
   "description": "Cross-machine Postgres transport plugin for agent-relay (self-contained drop-in).",
   "type": "module",
   "main": "index.mjs",
-  "bin": {
-    "agent-relay-pg": "scripts/install.mjs"
-  },
   "files": [
     "index.mjs",
     "env-file.mjs",
     "transport/",
-    "credentials/",
-    "scripts/install.mjs",
-    "scripts/preflight-cross-machine.mjs"
+    "credentials/"
   ],
   "agentRelay": {
     "entry": "index.mjs"

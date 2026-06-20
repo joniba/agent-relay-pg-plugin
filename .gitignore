@@ -1,3 +1,6 @@
 node_modules/
 bin/
 .env
+
+# In-repo git worktrees (feature work) — never tracked.
+worktrees/

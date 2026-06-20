@@ -12,25 +12,65 @@ agent-relay core is **local-only** by default (sessions on one machine). Install
 
 ## Install
 
-**One command — installs core *and* this plugin:**
+This plugin has **no installer of its own** — [agent-relay core](https://github.com/joniba/agent-relay)
+installs any plugin from its GitHub repo. Two steps:
 
 ```bash
-npx --yes github:joniba/agent-relay-pg-plugin
+# 1. install agent-relay core (local-only; skip if you already have it)
+npx --yes github:joniba/agent-relay
+
+# 2. add THIS plugin (clones it, installs its deps, drops it into the extension's plugins/ folder)
+npx --yes github:joniba/agent-relay --add-plugin github:joniba/agent-relay-pg-plugin
 ```
 
-It git-clones agent-relay core, runs core's own installer (into `<COPILOT_HOME>/extensions/agent-relay/`),
-then drops this plugin into that extension's own `plugins/agent-relay-pg/` folder. **If** you've set the
-Postgres connection vars (below), it also writes the plugin's `.env` and verifies a real connection;
-otherwise it installs everything and tells you exactly what to set. It does **not** launch Copilot.
+`--add-plugin` git-clones this repo, runs `npm install --omit=dev` for its deps (`pg`,
+`@azure/identity`), and copies the runtime files into
+`<COPILOT_HOME>/extensions/agent-relay/plugins/agent-relay-pg/`. It does **not** launch Copilot, and
+it does **not** configure the connection — you do that once (below).
 
-> **Requirements:** Node 22.5+, **Git** on PATH (the installer clones core), and a reachable Postgres
-> (Azure Database for PostgreSQL for the Entra path). For the Entra path you `az login` as the database
-> admin — the installer signs you in if needed; **provisioning** (below) requires `az login` first.
+> **Requirements:** Node 22.5+, **Git** on PATH (core clones this repo), and a reachable Postgres
+> (Azure Database for PostgreSQL for the Entra path).
 
-### Quickstart (Azure / Entra)
+### Configure the connection (one-time)
 
-**1. Provision the database (one-time).** Provisioning runs **from a clone** — the script isn't part of
-the `npx` install:
+The plugin reads its **own** gitignored `.env` at startup, from the installed plugin folder:
+
+```
+<COPILOT_HOME>/extensions/agent-relay/plugins/agent-relay-pg/.env
+```
+
+Create that file. **Azure / Entra:**
+
+```ini
+AGENT_RELAY_PG_HOST="pg-agent-relay-<unique>.postgres.database.azure.com"
+AGENT_RELAY_PG_USER="<your-entra-admin-upn>"
+AGENT_RELAY_PG_DB="agentrelay"
+# AGENT_RELAY_AZURE_TENANT="<tenant-id>"   # if your account spans tenants / the DB tenant needs MFA
+```
+
+Then `az login` as that database admin — the plugin mints a short-lived **Microsoft Entra** token
+locally at runtime (tokens are never written to config/logs or copied between machines):
+
+```bash
+az login        # sign in as AGENT_RELAY_PG_USER
+```
+
+**Local / CI (password auth, no Azure)** — TLS off, password instead of Entra (throwaway DBs only):
+
+```ini
+AGENT_RELAY_PG_HOST="localhost"
+AGENT_RELAY_PG_USER="postgres"
+AGENT_RELAY_PG_DB="postgres"
+AGENT_RELAY_PG_PASSWORD="postgres"
+AGENT_RELAY_PG_SSL="false"
+```
+
+> **Gotcha:** double-quote any value containing `#` (e.g. an Entra guest UPN `user#EXT#@tenant`) —
+> the `.env` parser treats an unquoted `#` as a comment.
+
+### Provision a database (one-time, optional)
+
+If you don't already have a Postgres, provision an Azure one **from a clone** (not part of the install):
 
 ```bash
 git clone https://github.com/joniba/agent-relay-pg-plugin
@@ -39,25 +79,18 @@ az login                                      # the signed-in identity becomes t
 pwsh ./scripts/provision-azure.ps1 -ServerName pg-agent-relay-<unique>
 ```
 
-It prints the `AGENT_RELAY_PG_HOST` / `_USER` / `_DB` values to use next. (Already have a Postgres? Skip this.)
+It prints the `AGENT_RELAY_PG_HOST` / `_USER` / `_DB` values to put in the `.env` above.
 
-**2. Point the installer at the database** — export the vars (for the `npx` path), or set
-`AGENT_RELAY_ENV_FILE=/path/to/your.env`, or (from a clone) put them in a `.env` next to this README:
+### Verify + start
 
-```bash
-export AGENT_RELAY_PG_HOST=pg-agent-relay-<unique>.postgres.database.azure.com
-export AGENT_RELAY_PG_USER='<your-entra-admin-upn>'
-export AGENT_RELAY_PG_DB=agentrelay
-# export AGENT_RELAY_AZURE_TENANT=<tenant-id>   # if your account spans tenants / the DB tenant needs MFA
-```
-
-**3. Install** (signs you in to Azure if needed, then verifies the connection):
+Optionally verify the connection **from a clone** (after creating a `.env` there and running
+`npm install` for the `pg` / `@azure/identity` deps):
 
 ```bash
-npx --yes github:joniba/agent-relay-pg-plugin
+node scripts/preflight-cross-machine.mjs        # exits 0 on a real connect, else a classified error
 ```
 
-**4. Start Copilot** with extensions enabled:
+Then start Copilot with extensions enabled:
 
 ```bash
 copilot --experimental
@@ -66,20 +99,6 @@ copilot --experimental
 On load you'll see `🌐 agent-relay: connected to remote transport as [<alias>]`, and peers on other
 machines (also running this plugin against the same DB) become reachable via `send_message` /
 `list_relay_agents`.
-
-### Local / CI (password auth, no Azure)
-
-For a local Docker Postgres or CI, use password auth instead of Entra. Make sure the target database
-exists first — a stock `postgres` container only has the default `postgres` DB unless you set `POSTGRES_DB`:
-
-```bash
-export AGENT_RELAY_PG_HOST=localhost
-export AGENT_RELAY_PG_USER=postgres
-export AGENT_RELAY_PG_DB=postgres         # the default DB in a stock postgres container
-export AGENT_RELAY_PG_PASSWORD=postgres
-export AGENT_RELAY_PG_SSL=false           # local server has no TLS
-npx --yes github:joniba/agent-relay-pg-plugin
-```
 
 ## How it works
 
@@ -90,8 +109,9 @@ the wake header + roster). It depends only on what it imports (`pg`, `@azure/ide
 dependency**; the installer git-clones it.
 
 The installer copies a strict **runtime allowlist** into the plugin folder — `package.json`, `index.mjs`,
-`env-file.mjs`, `transport/`, `credentials/`, `node_modules/` — and nothing else (no `tests/`, `scripts/`,
-or the cloned-core `bin/`).
+`env-file.mjs`, `transport/`, `credentials/`, and the installed `node_modules/` — and nothing else (no
+`tests/` or `scripts/`). The set comes from this package's `files` list, which core reads when you run
+`agent-relay --add-plugin`.
 
 ## Security model
 
@@ -126,20 +146,29 @@ no always-on cleanup job is needed.
 
 ## Upgrade / uninstall
 
-- **Upgrade:** re-run the install command.
+These use **agent-relay core**'s plugin commands (this plugin has no scripts of its own):
+
+- **Upgrade:** re-run the add command — it re-clones and reinstalls the plugin (your `.env` in the
+  plugin folder is preserved across the upgrade):
+
+  ```bash
+  npx --yes github:joniba/agent-relay --add-plugin github:joniba/agent-relay-pg-plugin
+  ```
+
 - **Remove just this plugin** (core stays, reverts to the local SQLite default):
 
   ```bash
-  npx --yes github:joniba/agent-relay-pg-plugin --uninstall
+  npx --yes github:joniba/agent-relay --remove-plugin agent-relay-pg
   ```
 
-- **Remove the plugin, core, and any other plugins under the extension:**
+- **Remove the whole extension** (core + every plugin):
 
   ```bash
-  npx --yes github:joniba/agent-relay-pg-plugin --uninstall-all            # add --purge to also delete the local runtime DB + logs (never Azure)
+  npx --yes github:joniba/agent-relay --uninstall            # add --purge to also delete the local runtime DB + logs (never Azure)
   ```
 
-(Neither touches your Azure database — see *Teardown* below for that.)
+(None of these touch your Azure database — see *Teardown* below for that. Your plugin `.env` lives in the
+plugin folder, so removing the plugin removes it too.)
 
 ## Teardown (remove the Azure resources)
 
@@ -170,6 +199,4 @@ messaging *without* deleting the database, just uninstall the plugin — see abo
 | `AGENT_RELAY_AZURE_TENANT` | Target tenant id for `az login` / token (multi-tenant or MFA). |
 | `AZURE_CONFIG_DIR` | Isolate the `az` profile used for the token. |
 | `AGENT_RELAY_HOST` | Override this session's machine label (default: hostname). |
-| `AGENT_RELAY_ENV_FILE` | Path to a `.env` the installer reads the above from (alternative to exporting them). |
-| `AGENT_RELAY_CORE_REF` | Core git ref/commit the installer clones (advanced; default: a pinned tested commit — Phase-4 release retargets it to `main`). |
-| `AGENT_RELAY_CORE_REPO` | Core repo URL the installer clones (advanced/dev; default the public repo — point at a local path for offline/dev installs). |
+| `AGENT_RELAY_ENV_FILE` | Path to a `.env` the plugin reads its settings from at runtime (overrides the default `<plugin-dir>/.env`). |
