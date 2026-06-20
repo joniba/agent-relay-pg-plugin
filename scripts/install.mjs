@@ -33,12 +33,15 @@ const warn = (m) => console.warn(`${YELLOW}${m}${RESET}`);
 const info = (m) => console.log(`${CYAN}${m}${RESET}`);
 const die = (m) => { console.error(`\n${m}`); process.exit(1); };
 
-// Pinned core ref. Until core's plugin-split branch lands on `main` (Phase 4) this
-// tracks the integration branch; override either with an env var.
+// Where to get core from. Override the repo with AGENT_RELAY_CORE_REPO (e.g. a local clone).
 const CORE_REPO = process.env.AGENT_RELAY_CORE_REPO || "https://github.com/joniba/agent-relay.git";
-// Pinned to a TESTED core commit (not a moving branch) for reproducible installs. Phase 4
-// retargets this to the release ref on `main`. Override with AGENT_RELAY_CORE_REF.
-const CORE_REF = process.env.AGENT_RELAY_CORE_REF || "e124909778477d82fac5cd4f9853372ac1a94043";
+// Default core ref: the MOVABLE `core-latest` tag in the core repo. Using a tag (not a pinned
+// SHA) lets us retarget which tested core this plugin installs by MOVING the tag in the core
+// repo — with NO change to this installer. Until the split lands on `main` the tag tracks the
+// integration-branch tip; post-merge it moves to each release commit on main. `obtainCore()`
+// resolves it the same as any ref (clone + checkout; refresh uses `fetch --tags --force`, so a
+// moved tag is picked up). Override with AGENT_RELAY_CORE_REF (a branch, tag, or SHA).
+const CORE_REF = process.env.AGENT_RELAY_CORE_REF || "core-latest";
 const PG_SCOPE = "https://ossrdbms-aad.database.windows.net/.default";
 
 // scripts/<this> -> package root is one dir up.
