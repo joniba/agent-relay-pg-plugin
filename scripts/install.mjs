@@ -19,7 +19,7 @@
 import {
   existsSync, mkdirSync, cpSync, readFileSync, writeFileSync, rmSync,
 } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -48,6 +48,64 @@ const coreInstall = join(copilotHome, "extensions", "agent-relay");
 const pluginDest = join(coreInstall, "plugins", "agent-relay-pg");
 const binDir = join(pkgRoot, "bin");
 const coreClone = join(binDir, "agent-relay");
+
+// --- Uninstall modes (early exit; no clone/install needed) -------------------
+const PURGE = argv.includes("--purge");
+if (argv.includes("--uninstall-all")) {
+  // Remove the WHOLE extension — core + this plugin + any other plugins.
+  if (existsSync(coreInstall)) { rmSync(coreInstall, { recursive: true, force: true }); ok(`\u2713 Removed ${coreInstall} (core + plugins)`); }
+  else { info(`Nothing installed at ${coreInstall}.`); }
+  revertStatusline();
+  if (PURGE) purgeState();
+  else info(`Runtime state (DB + logs) kept at ${dataDir()} — re-run with --purge to remove it too.`);
+  info(`\nagent-relay + agent-relay-pg uninstalled.`);
+  process.exit(0);
+}
+if (argv.includes("--uninstall")) {
+  // Remove ONLY this plugin; core stays installed and reverts to the local SQLite default.
+  if (existsSync(pluginDest)) { rmSync(pluginDest, { recursive: true, force: true }); ok(`\u2713 Removed the agent-relay-pg plugin (${pluginDest})`); }
+  else { info(`The agent-relay-pg plugin isn't installed (${pluginDest}).`); }
+  info(`\nCore agent-relay is still installed — it now runs LOCAL-only. To remove core too, run either:`);
+  info(`  npx --yes github:joniba/agent-relay-pg-plugin --uninstall-all   (removes plugin + core)`);
+  info(`  npx --yes github:joniba/agent-relay --uninstall                 (removes core)`);
+  process.exit(0);
+}
+
+/** Reset Copilot's statusLine ONLY if it points at agent-relay's statusline script. */
+function revertStatusline() {
+  const settingsPath = join(copilotHome, "settings.json");
+  if (!existsSync(settingsPath)) return;
+  let settings;
+  try { settings = JSON.parse(readFileSync(settingsPath, "utf8")); } catch { return; }
+  const cmd = settings && settings.statusLine && settings.statusLine.command;
+  if (typeof cmd === "string" && /agent-relay-statusline\.mjs/.test(cmd)) {
+    delete settings.statusLine;
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf8");
+    ok(`\u2713 Reverted Copilot statusline (${settingsPath})`);
+  }
+}
+
+/** Per-user data dir (DB + logs) — mirrors agent-relay core's resolveDataDir(). */
+function dataDir() {
+  if (process.env.AGENT_RELAY_DATA_DIR) return process.env.AGENT_RELAY_DATA_DIR;
+  if (process.platform === "win32") return join(process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local"), "agent-relay");
+  if (process.platform === "darwin") return join(homedir(), "Library", "Application Support", "agent-relay");
+  return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "agent-relay");
+}
+
+/** With --purge: remove the data dir, but ONLY when it's a dedicated `agent-relay` dir (the
+ *  default, or a custom AGENT_RELAY_DATA_DIR whose leaf is `agent-relay`). For any other custom
+ *  dir we refuse — never risk wiping a shared directory the user pointed us at. */
+function purgeState() {
+  const dd = dataDir();
+  if (!existsSync(dd)) { info(`No runtime state at ${dd}.`); return; }
+  if (basename(dd) === "agent-relay") {
+    rmSync(dd, { recursive: true, force: true });
+    ok(`\u2713 Removed runtime state (DB + logs): ${dd}`);
+  } else {
+    warn(`--purge skipped: AGENT_RELAY_DATA_DIR=${dd} is not a dedicated 'agent-relay' directory; refusing to delete it wholesale. Remove ${join(dd, "agent-relay.db")} (+ -wal/-shm) and the agent-relay logs manually for a full reset.`);
+  }
+}
 
 /** On Windows, npm/az are `.cmd` shims: they can't be spawned directly (Node refuses to
  *  run a `.cmd` without a shell) and `shell:true` + an args array is deprecated AND leaves

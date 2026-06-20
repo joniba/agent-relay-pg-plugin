@@ -127,8 +127,19 @@ no always-on cleanup job is needed.
 ## Upgrade / uninstall
 
 - **Upgrade:** re-run the install command.
-- **Opt out of cross-machine:** delete `<COPILOT_HOME>/extensions/agent-relay/plugins/agent-relay-pg/` —
-  core reverts to the local SQLite default. (Reinstalling core never deletes that folder.)
+- **Remove just this plugin** (core stays, reverts to the local SQLite default):
+
+  ```bash
+  npx --yes github:joniba/agent-relay-pg-plugin --uninstall
+  ```
+
+- **Remove the plugin, core, and any other plugins under the extension:**
+
+  ```bash
+  npx --yes github:joniba/agent-relay-pg-plugin --uninstall-all            # add --purge to also delete the local runtime DB + logs (never Azure)
+  ```
+
+(Neither touches your Azure database — see *Teardown* below for that.)
 
 ## Teardown (remove the Azure resources)
 
