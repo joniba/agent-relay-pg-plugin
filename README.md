@@ -113,6 +113,20 @@ The installer copies a strict **runtime allowlist** into the plugin folder — `
 `tests/` or `scripts/`). The set comes from this package's `files` list, which core reads when you run
 `agent-relay --add-plugin`.
 
+## Upgrading
+
+**Both machines must run a build with the same schema support before either uses the new features.**
+The transport records a `schema_version` and refuses to start against a database newer than it
+understands, so a *fresh* start of an older build against an upgraded database fails fast with a clear
+message rather than corrupting anything.
+
+An **already-running** older session is unaffected: the version check happens once, inside the
+migration at startup, and migrations are additive (new columns are nullable with defaults, and older
+builds select explicit columns), so it keeps relaying until you restart it.
+
+> **Note:** `scripts/preflight-cross-machine.mjs` brings the transport up, which means it **runs the
+> migration**. The apparently read-only check is what performs the upgrade.
+
 ## Security model
 
 For the **Azure / Entra** path:

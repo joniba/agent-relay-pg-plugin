@@ -470,3 +470,109 @@ test("sweep no-ops (does not delete) when another session holds the sweep lock",
 after(async () => {
   // nothing global to tear down; each transport stops itself.
 });
+
+// ─── session attributes (migration 2) ────────────────────────────
+
+test("migration 2 adds the attributes column and is idempotent across concurrent migrators", { skip }, async () => {
+  // Two transports coming up at once is the normal case on a two-machine mesh, and
+  // the advisory lock is what keeps that from racing.
+  const [a, b] = [makeTransport(), makeTransport()];
+  await Promise.all([
+    a.init({ self: { id: "s-a", name: "a" }, credentials: staticCreds() }),
+    b.init({ self: { id: "s-b", name: "b" }, credentials: staticCreds() }),
+  ]);
+
+  const pool = new pg.Pool({ ...PG, ssl: false, max: 1 });
+  try {
+    const col = await pool.query(
+      `SELECT data_type FROM information_schema.columns
+        WHERE table_name = 'agents' AND column_name = 'attributes'`,
+    );
+    assert.equal(col.rows[0]?.data_type, "jsonb");
+    const version = await pool.query("SELECT value FROM agent_relay_meta WHERE key = 'schema_version'");
+    assert.equal(version.rows[0].value, "2");
+  } finally {
+    await pool.end();
+  }
+});
+
+test("attributes round-trip through register and listAgents", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes["role.owner"], "2026-01-01");
+});
+
+test("the transport-derived machine wins over a session-published one", { skip }, async () => {
+  // `machine` comes from this transport's own column. A session claiming it should
+  // not be able to displace the infrastructure's own answer.
+  const t = makeTransport({ machine: "real-box" });
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { machine: "spoofed" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes.machine, "real-box");
+});
+
+test("setAttributes PATCHes, and null removes a key", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { a: "1", b: "2" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const patched = await t.setAttributes({ attributes: { b: "changed", c: "3" } });
+  assert.deepEqual(patched.attributes, { a: "1", b: "changed", c: "3" });
+
+  const removed = await t.setAttributes({ attributes: { a: null } });
+  assert.deepEqual(removed.attributes, { b: "changed", c: "3" });
+  assert.ok(!("a" in removed.attributes), "the key must be gone, not set to null");
+});
+
+test("writing another session's attributes needs force", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  const victim = { id: `s-${randomUUID()}`, name: "gull" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+  await t.register(victim);
+  await t.register(self); // re-assert who `self` is after registering the other id
+
+  const refused = await t.setAttributes({ id: victim.id, attributes: { x: "1" } });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /without force/);
+
+  const forced = await t.setAttributes({ id: victim.id, attributes: { x: "1" }, force: true });
+  assert.equal(forced.ok, true);
+});
+
+test("re-registering without attributes does NOT erase the stored ones", { skip }, async () => {
+  // The resume path: a returning session supplies none, because they live here.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+  await t.register({ id: self.id, name: "loon" });
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes["role.owner"], "2026-01-01");
+});
+
+test("concurrent writers patching DIFFERENT keys do not clobber each other", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  await Promise.all([
+    t.setAttributes({ attributes: { "role.first": "1" } }),
+    t.setAttributes({ attributes: { "role.second": "2" } }),
+  ]);
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes["role.first"], "1");
+  assert.equal(agent.attributes["role.second"], "2");
+});
