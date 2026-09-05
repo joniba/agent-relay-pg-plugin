@@ -102,7 +102,11 @@ export function classify(err, env = process.env) {
   if (/newer than this build/i.test(msg)) {
     return {
       code: EXIT.SCHEMA_NEWER,
-      message: `The database schema is newer than this extension.\n→ Update agent-relay (git pull) on this machine.\n(${msg})`,
+      message:
+        `The database schema is newer than this build of the Postgres plugin.\n` +
+        `→ Upgrade the INSTALLED plugin (a git pull here only updates this clone):\n` +
+        `    npx --yes github:joniba/agent-relay --add-plugin github:joniba/agent-relay-pg-plugin\n` +
+        `(${msg})`,
     };
   }
   return { code: EXIT.OTHER, message: `Cross-machine preflight failed: ${msg}` };
