@@ -11,6 +11,12 @@
 //   AGENT_RELAY_TEST_PG_PORT=5433 AGENT_RELAY_TEST_PG_USER=postgres \
 //   AGENT_RELAY_TEST_PG_PASSWORD=relaytest AGENT_RELAY_TEST_PG_DB=postgres \
 //     node --test tests/postgres.integration.test.mjs
+//
+// Any real Postgres works — point the vars at one. If Docker is unavailable, the
+// `embedded-postgres` package starts a genuine server from a downloaded binary with
+// no daemon and no container. Note that an in-process engine such as PGlite is NOT
+// sufficient: it accepts a single connection, and these tests deliberately open
+// several to exercise advisory locks, alias races and SKIP LOCKED.
 
 import { test, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -575,4 +581,53 @@ test("concurrent writers patching DIFFERENT keys do not clobber each other", { s
   const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
   assert.equal(agent.attributes["role.first"], "1");
   assert.equal(agent.attributes["role.second"], "2");
+});
+
+test("a re-register after a removal must NOT resurrect the removed key", { skip }, async () => {
+  // The heartbeat re-registers whenever its UPDATE matches no row — a laptop waking,
+  // or a stall past staleMs — passing the SAME identity object it started with. If
+  // setAttributes only wrote the database, that object still held keys it had just
+  // deleted, and the additive merge put them back unannounced. Note the asymmetry
+  // that hides this: additions survive either way, so only removals are undone.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  await t.setAttributes({ attributes: { "role.owner": null } });
+  await t.register(self); // exactly what the heartbeat's non-resurrecting path does
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.ok(!("role.owner" in (agent.attributes ?? {})), "a released role must stay released");
+});
+
+test("an undefined value REMOVES the key rather than reporting a false success", { skip }, async () => {
+  // undefined is not a value jsonb can hold and JSON.stringify drops it, so treating
+  // it as a set produced an empty patch that still reported ok — telling the caller a
+  // key was cleared when it was not. A patch built from a lookup that missed lands here.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const res = await t.setAttributes({ attributes: { "role.owner": undefined } });
+  assert.equal(res.ok, true);
+  assert.ok(!("role.owner" in res.attributes), "undefined must clear the key");
+});
+
+test("a non-object attributes bag cannot corrupt the column into a jsonb array", { skip }, async () => {
+  // Postgres `||` treats a non-object operand as a single-element ARRAY, and there is
+  // no way back through any exposed operation: later merges append instead of merging
+  // and key removal silently no-ops. setAttributes validated its input; register did not.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register({ ...self, attributes: ["hostile"] });
+
+  const res = await t.setAttributes({ attributes: { "role.owner": "2026-01-01" } });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.attributes, { "role.owner": "2026-01-01" });
+
+  const removed = await t.setAttributes({ attributes: { "role.owner": null } });
+  assert.deepEqual(removed.attributes, {}, "removal must still work, i.e. it is an object");
 });

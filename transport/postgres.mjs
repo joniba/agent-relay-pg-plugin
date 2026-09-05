@@ -10,6 +10,20 @@
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Coerce an attributes bag to something `||` can merge.
+ *
+ * `setAttributes` validates its input; `register` took `identity.attributes` on
+ * trust, and this transport is duck-typed and self-contained, so it cannot assume
+ * core checked. Postgres treats a non-object operand of `||` as a single-element
+ * array, which turns the column into a jsonb ARRAY — after which merges append
+ * instead of merging, key removal silently does nothing, and there is no path back
+ * through any exposed operation.
+ */
+function plainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+/**
  * Cross-machine Transport: a shared PostgreSQL store + interval poll. The
  * cross-machine analogue of `sqlite-poll.mjs` — same two-table model (an `agents`
  * registry + a `messages` inbox), same contract, so the core is unchanged. Only
@@ -149,7 +163,7 @@ export function createPostgresTransport({
                -- they live here, not in its configuration — so replacing would erase
                -- everything it had published before anything could notice.
                attributes = agents.attributes || excluded.attributes`,
-        [identity.id, name, machine ?? null, JSON.stringify(identity.attributes ?? {})],
+        [identity.id, name, machine ?? null, JSON.stringify(plainObject(identity.attributes))],
       );
       await client.query("COMMIT");
     } catch (err) {
@@ -370,8 +384,12 @@ export function createPostgresTransport({
           error: `refusing to write attributes on another session (${target}) without force`,
         };
       }
-      const removals = Object.keys(attributes).filter((k) => attributes[k] === null);
-      const sets = Object.fromEntries(Object.entries(attributes).filter(([, v]) => v !== null));
+      // `undefined` is a removal too. It is not a value jsonb can hold, and
+      // JSON.stringify silently drops it — so treating it as a set produced an empty
+      // patch that still reported ok, telling a caller a key was cleared when it was
+      // not. A patch built from a lookup that missed is exactly how one arrives here.
+      const removals = Object.keys(attributes).filter((k) => attributes[k] == null);
+      const sets = Object.fromEntries(Object.entries(attributes).filter(([, v]) => v != null));
       const res = await pool.query(
         `UPDATE agents
             SET attributes = (COALESCE(attributes, '{}'::jsonb) || $2::jsonb) - $3::text[]
@@ -380,7 +398,17 @@ export function createPostgresTransport({
         [target, JSON.stringify(sets), removals],
       );
       if (res.rowCount === 0) return { ok: false, error: `no such agent: ${target}` };
-      return { ok: true, attributes: res.rows[0].attributes ?? {} };
+      const stored = res.rows[0].attributes ?? {};
+      // Keep the in-memory identity in step with the row.
+      //
+      // The heartbeat re-registers when its UPDATE matches no row — a laptop waking,
+      // or a stall past staleMs — and `register` merges `identity.attributes` back in.
+      // Left stale, that object still holds keys this call has just DELETED, so they
+      // return unannounced. The merge is right; the stale source was the bug. Note the
+      // asymmetry that hides it: additions survive re-registration either way, so only
+      // removals are undone.
+      if (target === self.id) self.attributes = stored;
+      return { ok: true, attributes: stored };
     },
 
     async send(message) {
