@@ -631,3 +631,60 @@ test("a non-object attributes bag cannot corrupt the column into a jsonb array",
   const removed = await t.setAttributes({ attributes: { "role.owner": null } });
   assert.deepEqual(removed.attributes, {}, "removal must still work, i.e. it is an object");
 });
+
+test("a session cannot publish a key this transport asserts", { skip }, async () => {
+  // machine is overlaid from device_name on read, so a session's write would persist,
+  // be echoed back as though it had taken effect, and then be invisible to every peer
+  // -- including a null removal reporting a key cleared that everyone still sees.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const spoof = await t.setAttributes({ attributes: { machine: "spoofed", role: "x" } });
+  assert.equal(spoof.ok, false);
+  assert.match(spoof.error, /reserved by the Postgres transport/);
+
+  const remove = await t.setAttributes({ attributes: { machine: null } });
+  assert.equal(remove.ok, false, "a removal must be refused for the same reason");
+
+  // And the honest key still works.
+  const ok = await t.setAttributes({ attributes: { role: "x" } });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.attributes, { role: "x" });
+});
+
+test("a corrupt attributes column cannot be made worse, and does not leak into the roster", { skip }, async () => {
+  // NOT NULL DEFAULT '{}' makes NULL unreachable, but the jsonb TYPE is unconstrained:
+  // a direct UPDATE or a foreign writer can leave an array there. Core guards the same
+  // hazard on the local transport, and read and write must agree that it is survivable.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const pool = new pg.Pool({ ...PG, ssl: false });
+  await pool.query("UPDATE agents SET attributes = $2::jsonb WHERE id = $1", [self.id, '["corrupt"]']);
+  await pool.end();
+
+  const res = await t.setAttributes({ attributes: { role: "x" } });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.attributes, { role: "x" }, "the patch must recover, not append");
+
+  const [agent] = (await t.listAgents()).filter((a) => a.id === self.id);
+  assert.equal(agent.attributes.role, "x");
+  assert.ok(!("0" in agent.attributes), "array indices must never reach a peer's roster");
+});
+
+test("register cannot corrupt the column via a toJSON that serialises to an array", { skip }, async () => {
+  // The structural check passes -- it is a non-array object -- and JSON.stringify then
+  // emits an array anyway, so the guard has to inspect the SERIALISED form.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register({ ...self, attributes: { toJSON: () => ["hostile"] } });
+
+  const res = await t.setAttributes({ attributes: { role: "x" } });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.attributes, { role: "x" });
+});

@@ -18,10 +18,38 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * array, which turns the column into a jsonb ARRAY — after which merges append
  * instead of merging, key removal silently does nothing, and there is no path back
  * through any exposed operation.
+ *
+ * Checked on the SERIALISED form, because that is what actually reaches the database:
+ * an object carrying a `toJSON` returning an array passes every structural test here
+ * and still stringifies to `[…]`.
  */
 function plainObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  try {
+    const parsed = JSON.parse(JSON.stringify(value ?? {}));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
+
+/** Keys this transport asserts itself, which a session therefore may not publish. */
+const RESERVED_KEYS = new Set(["machine"]);
+
+/**
+ * The attributes column as a *mergeable* expression.
+ *
+ * Mirrors core's guard on the local transport, and for the same reason: the read path
+ * tolerates a bad column value, so the write path must too, or the two disagree about
+ * whether one is survivable. `NOT NULL DEFAULT '{}'` makes NULL unreachable, but the
+ * jsonb TYPE is unconstrained — a foreign writer, or a direct UPDATE, can leave an
+ * array or a scalar there, and every subsequent operation would report success while
+ * making it worse.
+ */
+const VALID_ATTRIBUTES_OF = (table) => {
+  const col = table ? `${table}.attributes` : "attributes";
+  return `CASE WHEN jsonb_typeof(${col}) = 'object' THEN ${col} ELSE '{}'::jsonb END`;
+};
+const VALID_ATTRIBUTES = VALID_ATTRIBUTES_OF();
 
 /**
  * Cross-machine Transport: a shared PostgreSQL store + interval poll. The
@@ -162,7 +190,7 @@ export function createPostgresTransport({
                -- MERGE, never replace. A resuming session supplies no attributes —
                -- they live here, not in its configuration — so replacing would erase
                -- everything it had published before anything could notice.
-               attributes = agents.attributes || excluded.attributes`,
+               attributes = ${VALID_ATTRIBUTES_OF("agents")} || excluded.attributes`,
         [identity.id, name, machine ?? null, JSON.stringify(plainObject(identity.attributes))],
       );
       await client.query("COMMIT");
@@ -341,7 +369,7 @@ export function createPostgresTransport({
     async listAgents() {
       const rows = (
         await pool.query(
-          `SELECT id, name, device_name, attributes FROM agents
+          `SELECT id, name, device_name, ${VALID_ATTRIBUTES} AS attributes FROM agents
            WHERE online AND last_heartbeat >= now() - make_interval(secs => $1)
            ORDER BY name`,
           [staleSecs],
@@ -384,6 +412,21 @@ export function createPostgresTransport({
           error: `refusing to write attributes on another session (${target}) without force`,
         };
       }
+      // `machine` is asserted by this transport from its own column, so a session's
+      // write to it would persist, be echoed back as though it had taken effect, and
+      // then be invisible to every peer — including a `null` removal reporting that a
+      // key was cleared while everyone still sees it. That is the same "told a key was
+      // cleared when it was not" failure the undefined rule below exists to prevent,
+      // so it is refused rather than quietly overlaid.
+      const reserved = Object.keys(attributes).filter((k) => RESERVED_KEYS.has(k));
+      if (reserved.length) {
+        return {
+          ok: false,
+          error:
+            `'${reserved.join("', '")}' is reserved by the Postgres transport, which derives ` +
+            `it rather than taking a session's word for it. Publish under a different key.`,
+        };
+      }
       // `undefined` is a removal too. It is not a value jsonb can hold, and
       // JSON.stringify silently drops it — so treating it as a set produced an empty
       // patch that still reported ok, telling a caller a key was cleared when it was
@@ -392,7 +435,7 @@ export function createPostgresTransport({
       const sets = Object.fromEntries(Object.entries(attributes).filter(([, v]) => v != null));
       const res = await pool.query(
         `UPDATE agents
-            SET attributes = (COALESCE(attributes, '{}'::jsonb) || $2::jsonb) - $3::text[]
+            SET attributes = (${VALID_ATTRIBUTES} || $2::jsonb) - $3::text[]
           WHERE id = $1
         RETURNING attributes`,
         [target, JSON.stringify(sets), removals],
