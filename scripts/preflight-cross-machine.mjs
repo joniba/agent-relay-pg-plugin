@@ -99,11 +99,14 @@ export function classify(err, env = process.env) {
       message: `Could not reach the database host '${host}'.\n→ Check AGENT_RELAY_PG_HOST, your network, and that the server is running.\n(${msg})`,
     };
   }
-  if (/newer than this build/i.test(msg)) {
+  // Matches the shape of the message rather than one exact phrase, because this
+  // classifier only ever sees a serialised error — it cannot check the type the
+  // transport threw. Kept broad for that reason.
+  if (/schema this build cannot read|newer than this build/i.test(msg)) {
     return {
       code: EXIT.SCHEMA_NEWER,
       message:
-        `The database schema is newer than this build of the Postgres plugin.\n` +
+        `The database schema needs a newer build of the Postgres plugin than this one.\n` +
         `→ Upgrade the INSTALLED plugin (a git pull here only updates this clone):\n` +
         `    npx --yes github:joniba/agent-relay --add-plugin github:joniba/agent-relay-pg-plugin\n` +
         `(${msg})`,

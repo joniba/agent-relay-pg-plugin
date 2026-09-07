@@ -123,19 +123,64 @@ test("migrate creates schema on a fresh DB and is idempotent", { skip }, async (
   await tx2.stop();
 });
 
-test("migrate refuses a NEWER schema than supported", { skip }, async () => {
+test("migrate refuses a schema this build cannot READ", { skip }, async () => {
   const tx = makeTransport();
   await tx.init(ctx("mv", "alpha"));
   await tx.stop();
-  // bump the stored version beyond TARGET, then a fresh init must throw
+  // Newer AND declaring it needs a newer reader — the only combination that refuses.
   const pool = new pg.Pool({ ...PG, ssl: false, max: 1 });
-  await pool.query(
-    "UPDATE agent_relay_meta SET value = '999' WHERE key = 'schema_version'",
-  );
+  await pool.query("UPDATE agent_relay_meta SET value = '999' WHERE key = 'schema_version'");
+  await pool.query("UPDATE agent_relay_meta SET value = '999' WHERE key = 'min_reader_version'");
   await pool.end();
   const tx2 = makeTransport();
-  await assert.rejects(() => tx2.init(ctx("mv2", "beta")), /newer than this build/i);
+  await assert.rejects(() => tx2.init(ctx("mv2", "beta")), /cannot read/i);
   await tx2.stop();
+});
+
+test("migrate ACCEPTS a newer schema that says older builds can still read it", { skip }, async () => {
+  // The whole point of the second number. An additive migration bumps schema_version
+  // and leaves min_reader_version alone, so a build that predates it keeps working —
+  // otherwise upgrading one machine stops fresh sessions on every other one, to
+  // protect against a change that did not break them.
+  const tx = makeTransport();
+  await tx.init(ctx("mr", "alpha"));
+  await tx.stop();
+  const pool = new pg.Pool({ ...PG, ssl: false, max: 1 });
+  await pool.query("UPDATE agent_relay_meta SET value = '999' WHERE key = 'schema_version'");
+  await pool.end();
+
+  const tx2 = makeTransport();
+  await tx2.init(ctx("mr2", "beta")); // must NOT throw
+  const agents = await tx2.listAgents();
+  assert.ok(Array.isArray(agents), "and the transport is usable, not merely non-throwing");
+  await tx2.stop();
+
+  // It must not have rewritten the version down to its own.
+  const check = new pg.Pool({ ...PG, ssl: false, max: 1 });
+  const v = await check.query("SELECT value FROM agent_relay_meta WHERE key = 'schema_version'");
+  await check.end();
+  assert.equal(v.rows[0].value, "999", "an older build must not downgrade the recorded version");
+});
+
+test("a database predating min_reader_version is treated as readable", { skip }, async () => {
+  // Every schema written before the key existed was additive, so 1 is the truthful
+  // answer rather than a lenient guess.
+  const tx = makeTransport();
+  await tx.init(ctx("pre", "alpha"));
+  await tx.stop();
+  const pool = new pg.Pool({ ...PG, ssl: false, max: 1 });
+  await pool.query("DELETE FROM agent_relay_meta WHERE key = 'min_reader_version'");
+  await pool.end();
+
+  const tx2 = makeTransport();
+  await tx2.init(ctx("pre2", "beta")); // must not throw
+  await tx2.stop();
+
+  // …and it is restored, so the next build does not have to infer it again.
+  const check = new pg.Pool({ ...PG, ssl: false, max: 1 });
+  const v = await check.query("SELECT value FROM agent_relay_meta WHERE key = 'min_reader_version'");
+  await check.end();
+  assert.equal(v.rows[0].value, "1");
 });
 
 // ── register / collision / presence ──────────────────────────────────────────

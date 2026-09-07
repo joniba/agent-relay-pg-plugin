@@ -117,27 +117,51 @@ The installer copies a strict **runtime allowlist** into the plugin folder — `
 
 Two different things get conflated here, so they're worth separating.
 
-**Schema compatibility** is what fails hard. The transport records a `schema_version` and refuses to
-start against a database newer than it understands, so a *fresh* start of an older build against an
-upgraded database fails fast with a clear message rather than corrupting anything. **Feature
-availability** is what degrades quietly: an older build that is still running is *relay-compatible but
-attribute-unaware* — it keeps messaging perfectly well, it just doesn't know the new column exists.
+**Schema compatibility** is what can fail hard. **Feature availability** is what degrades quietly: an
+older build is *relay-compatible but attribute-unaware* — it keeps messaging perfectly well, it just
+doesn't know a newer column exists.
 
-So the rule is **upgrade both machines before relying on attributes**, not because messaging breaks
-if you don't, but because attribute visibility is asymmetric until you do.
+So the rule is **upgrade both machines before relying on attributes**, not because messaging breaks if
+you don't, but because attribute visibility is asymmetric until you do.
+
+### Two version numbers, not one
+
+The database records both:
+
+| Key | Meaning |
+|---|---|
+| `schema_version` | what shape the database is in |
+| `min_reader_version` | the oldest build that can safely **read** that shape |
+
+A build refuses only when `min_reader_version` exceeds what it supports — not merely because the
+database is newer than it is. That distinction matters on a mesh: every migration so far has been
+**additive**, a column older builds never select, so refusing on `schema_version` alone locked out
+builds that would have worked fine. Upgrading one machine became a flag day for all of them,
+protecting against nothing.
+
+An additive migration therefore leaves `min_reader_version` alone, and older builds keep running. It
+is raised only by a migration that genuinely breaks them — dropping or renaming a column they select,
+changing a type underneath them, or altering what existing data means. Then the refusal is real, and
+the error says which version is required.
+
+> **This does not retroactively rescue migration 2.** A build older than this one has no notion of
+> `min_reader_version` and refuses on `schema_version` alone, so the staggered-upgrade window still
+> costs one flag day — the last one.
 
 | Scenario | What happens |
 |---|---|
-| Older session already running when migration 2 commits | Keeps relaying. The version check runs once inside `migrate()` at init, so it never rechecks — it simply never gains the new capability |
-| Fresh or restarted older build against schema 2 | `migrate()` refuses; that session's relay is inactive |
+| Older session already running when a migration commits | Keeps relaying. The check runs once inside `migrate()` at init and never rechecks — it simply never gains the new capability |
+| Fresh start of a build that predates `min_reader_version`, against schema 2 | `migrate()` refuses; that session's relay is inactive. Upgrade it — this is the last migration that does this |
+| Fresh start of an older build against a later **additive** migration | Runs normally. `min_reader_version` still permits it, and it does not migrate or rewrite the version |
 | One machine upgraded, the other still running its old build | Messaging continues both ways; attributes are visible only to the upgraded side |
-| Both upgraded, started at the same moment | An advisory transaction lock serialises them: one migrates, the other observes version 2 |
-| Migration fails part-way | It is one transaction — it rolls back, init fails, and the version is not bumped |
-| Downgrade, or removing the plugin, after schema 2 | There is no down-migration. The column stays; the database does not revert |
+| Both upgraded, started at the same moment | An advisory transaction lock serialises them: one migrates, the other observes the result |
+| Migration fails part-way | It is one transaction — it rolls back, init fails, and neither version is bumped |
+| Downgrade, or removing the plugin | There is no down-migration. The column stays; the database does not revert |
 
 Migration 2 is backward-compatible because the new column has a **default** (`jsonb NOT NULL DEFAULT
 '{}'`) and older builds select explicit column lists — not because it is nullable. That is a property
-of this migration, not a promise about every future one.
+of this migration, not a promise about every future one, which is precisely why the promise is now
+recorded in the database rather than inferred.
 
 > **Note:** `scripts/preflight-cross-machine.mjs` brings the transport up, which means it **runs the
 > migration**. The apparently read-only check is what performs the upgrade — and since you run it from
