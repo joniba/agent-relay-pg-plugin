@@ -11,6 +11,12 @@
 //   AGENT_RELAY_TEST_PG_PORT=5433 AGENT_RELAY_TEST_PG_USER=postgres \
 //   AGENT_RELAY_TEST_PG_PASSWORD=relaytest AGENT_RELAY_TEST_PG_DB=postgres \
 //     node --test tests/postgres.integration.test.mjs
+//
+// Any real Postgres works — point the vars at one. If Docker is unavailable, the
+// `embedded-postgres` package starts a genuine server from a downloaded binary with
+// no daemon and no container. Note that an in-process engine such as PGlite is NOT
+// sufficient: it accepts a single connection, and these tests deliberately open
+// several to exercise advisory locks, alias races and SKIP LOCKED.
 
 import { test, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -469,4 +475,216 @@ test("sweep no-ops (does not delete) when another session holds the sweep lock",
 
 after(async () => {
   // nothing global to tear down; each transport stops itself.
+});
+
+// ─── session attributes (migration 2) ────────────────────────────
+
+test("migration 2 adds the attributes column and is idempotent across concurrent migrators", { skip }, async () => {
+  // Two transports coming up at once is the normal case on a two-machine mesh, and
+  // the advisory lock is what keeps that from racing.
+  const [a, b] = [makeTransport(), makeTransport()];
+  await Promise.all([
+    a.init({ self: { id: "s-a", name: "a" }, credentials: staticCreds() }),
+    b.init({ self: { id: "s-b", name: "b" }, credentials: staticCreds() }),
+  ]);
+
+  const pool = new pg.Pool({ ...PG, ssl: false, max: 1 });
+  try {
+    const col = await pool.query(
+      `SELECT data_type FROM information_schema.columns
+        WHERE table_name = 'agents' AND column_name = 'attributes'`,
+    );
+    assert.equal(col.rows[0]?.data_type, "jsonb");
+    const version = await pool.query("SELECT value FROM agent_relay_meta WHERE key = 'schema_version'");
+    assert.equal(version.rows[0].value, "2");
+  } finally {
+    await pool.end();
+  }
+});
+
+test("attributes round-trip through register and listAgents", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes["role.owner"], "2026-01-01");
+});
+
+test("the transport-derived machine wins over a session-published one", { skip }, async () => {
+  // `machine` comes from this transport's own column. A session claiming it should
+  // not be able to displace the infrastructure's own answer.
+  const t = makeTransport({ machine: "real-box" });
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { machine: "spoofed" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes.machine, "real-box");
+});
+
+test("setAttributes PATCHes, and null removes a key", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { a: "1", b: "2" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const patched = await t.setAttributes({ attributes: { b: "changed", c: "3" } });
+  assert.deepEqual(patched.attributes, { a: "1", b: "changed", c: "3" });
+
+  const removed = await t.setAttributes({ attributes: { a: null } });
+  assert.deepEqual(removed.attributes, { b: "changed", c: "3" });
+  assert.ok(!("a" in removed.attributes), "the key must be gone, not set to null");
+});
+
+test("writing another session's attributes needs force", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  const victim = { id: `s-${randomUUID()}`, name: "gull" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+  await t.register(victim);
+  await t.register(self); // re-assert who `self` is after registering the other id
+
+  const refused = await t.setAttributes({ id: victim.id, attributes: { x: "1" } });
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /without force/);
+
+  const forced = await t.setAttributes({ id: victim.id, attributes: { x: "1" }, force: true });
+  assert.equal(forced.ok, true);
+});
+
+test("re-registering without attributes does NOT erase the stored ones", { skip }, async () => {
+  // The resume path: a returning session supplies none, because they live here.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+  await t.register({ id: self.id, name: "loon" });
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes["role.owner"], "2026-01-01");
+});
+
+test("concurrent writers patching DIFFERENT keys do not clobber each other", { skip }, async () => {
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  await Promise.all([
+    t.setAttributes({ attributes: { "role.first": "1" } }),
+    t.setAttributes({ attributes: { "role.second": "2" } }),
+  ]);
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.equal(agent.attributes["role.first"], "1");
+  assert.equal(agent.attributes["role.second"], "2");
+});
+
+test("a re-register after a removal must NOT resurrect the removed key", { skip }, async () => {
+  // The heartbeat re-registers whenever its UPDATE matches no row — a laptop waking,
+  // or a stall past staleMs — passing the SAME identity object it started with. If
+  // setAttributes only wrote the database, that object still held keys it had just
+  // deleted, and the additive merge put them back unannounced. Note the asymmetry
+  // that hides this: additions survive either way, so only removals are undone.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  await t.setAttributes({ attributes: { "role.owner": null } });
+  await t.register(self); // exactly what the heartbeat's non-resurrecting path does
+
+  const [agent] = (await t.listAgents()).filter((x) => x.id === self.id);
+  assert.ok(!("role.owner" in (agent.attributes ?? {})), "a released role must stay released");
+});
+
+test("an undefined value REMOVES the key rather than reporting a false success", { skip }, async () => {
+  // undefined is not a value jsonb can hold and JSON.stringify drops it, so treating
+  // it as a set produced an empty patch that still reported ok — telling the caller a
+  // key was cleared when it was not. A patch built from a lookup that missed lands here.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon", attributes: { "role.owner": "2026-01-01" } };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const res = await t.setAttributes({ attributes: { "role.owner": undefined } });
+  assert.equal(res.ok, true);
+  assert.ok(!("role.owner" in res.attributes), "undefined must clear the key");
+});
+
+test("a non-object attributes bag cannot corrupt the column into a jsonb array", { skip }, async () => {
+  // Postgres `||` treats a non-object operand as a single-element ARRAY, and there is
+  // no way back through any exposed operation: later merges append instead of merging
+  // and key removal silently no-ops. setAttributes validated its input; register did not.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register({ ...self, attributes: ["hostile"] });
+
+  const res = await t.setAttributes({ attributes: { "role.owner": "2026-01-01" } });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.attributes, { "role.owner": "2026-01-01" });
+
+  const removed = await t.setAttributes({ attributes: { "role.owner": null } });
+  assert.deepEqual(removed.attributes, {}, "removal must still work, i.e. it is an object");
+});
+
+test("a session cannot publish a key this transport asserts", { skip }, async () => {
+  // machine is overlaid from device_name on read, so a session's write would persist,
+  // be echoed back as though it had taken effect, and then be invisible to every peer
+  // -- including a null removal reporting a key cleared that everyone still sees.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const spoof = await t.setAttributes({ attributes: { machine: "spoofed", role: "x" } });
+  assert.equal(spoof.ok, false);
+  assert.match(spoof.error, /reserved by the Postgres transport/);
+
+  const remove = await t.setAttributes({ attributes: { machine: null } });
+  assert.equal(remove.ok, false, "a removal must be refused for the same reason");
+
+  // And the honest key still works.
+  const ok = await t.setAttributes({ attributes: { role: "x" } });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.attributes, { role: "x" });
+});
+
+test("a corrupt attributes column cannot be made worse, and does not leak into the roster", { skip }, async () => {
+  // NOT NULL DEFAULT '{}' makes NULL unreachable, but the jsonb TYPE is unconstrained:
+  // a direct UPDATE or a foreign writer can leave an array there. Core guards the same
+  // hazard on the local transport, and read and write must agree that it is survivable.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register(self);
+
+  const pool = new pg.Pool({ ...PG, ssl: false });
+  await pool.query("UPDATE agents SET attributes = $2::jsonb WHERE id = $1", [self.id, '["corrupt"]']);
+  await pool.end();
+
+  const res = await t.setAttributes({ attributes: { role: "x" } });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.attributes, { role: "x" }, "the patch must recover, not append");
+
+  const [agent] = (await t.listAgents()).filter((a) => a.id === self.id);
+  assert.equal(agent.attributes.role, "x");
+  assert.ok(!("0" in agent.attributes), "array indices must never reach a peer's roster");
+});
+
+test("register cannot corrupt the column via a toJSON that serialises to an array", { skip }, async () => {
+  // The structural check passes -- it is a non-array object -- and JSON.stringify then
+  // emits an array anyway, so the guard has to inspect the SERIALISED form.
+  const t = makeTransport();
+  const self = { id: `s-${randomUUID()}`, name: "loon" };
+  await t.init({ self, credentials: staticCreds() });
+  await t.register({ ...self, attributes: { toJSON: () => ["hostile"] } });
+
+  const res = await t.setAttributes({ attributes: { role: "x" } });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.attributes, { role: "x" });
 });

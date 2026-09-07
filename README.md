@@ -113,6 +113,61 @@ The installer copies a strict **runtime allowlist** into the plugin folder — `
 `tests/` or `scripts/`). The set comes from this package's `files` list, which core reads when you run
 `agent-relay --add-plugin`.
 
+## Upgrading
+
+Two different things get conflated here, so they're worth separating.
+
+**Schema compatibility** is what fails hard. The transport records a `schema_version` and refuses to
+start against a database newer than it understands, so a *fresh* start of an older build against an
+upgraded database fails fast with a clear message rather than corrupting anything. **Feature
+availability** is what degrades quietly: an older build that is still running is *relay-compatible but
+attribute-unaware* — it keeps messaging perfectly well, it just doesn't know the new column exists.
+
+So the rule is **upgrade both machines before relying on attributes**, not because messaging breaks
+if you don't, but because attribute visibility is asymmetric until you do.
+
+| Scenario | What happens |
+|---|---|
+| Older session already running when migration 2 commits | Keeps relaying. The version check runs once inside `migrate()` at init, so it never rechecks — it simply never gains the new capability |
+| Fresh or restarted older build against schema 2 | `migrate()` refuses; that session's relay is inactive |
+| One machine upgraded, the other still running its old build | Messaging continues both ways; attributes are visible only to the upgraded side |
+| Both upgraded, started at the same moment | An advisory transaction lock serialises them: one migrates, the other observes version 2 |
+| Migration fails part-way | It is one transaction — it rolls back, init fails, and the version is not bumped |
+| Downgrade, or removing the plugin, after schema 2 | There is no down-migration. The column stays; the database does not revert |
+
+Migration 2 is backward-compatible because the new column has a **default** (`jsonb NOT NULL DEFAULT
+'{}'`) and older builds select explicit column lists — not because it is nullable. That is a property
+of this migration, not a promise about every future one.
+
+> **Note:** `scripts/preflight-cross-machine.mjs` brings the transport up, which means it **runs the
+> migration**. The apparently read-only check is what performs the upgrade — and since you run it from
+> a clone, it can advance the shared database while the `npx`-installed plugin on *either* machine is
+> still the older build. The next fresh start of that installed build will then refuse. If that
+> happens, upgrade the install rather than the clone:
+>
+> ```bash
+> npx --yes github:joniba/agent-relay --add-plugin github:joniba/agent-relay-pg-plugin
+> ```
+
+## Session attributes
+
+Core lets a session publish key/value facts about itself onto its registry entry, and this transport
+stores them in a `jsonb` column that every machine shares. This is a **plugin-facing** capability on
+the relay handle — `relay.setAttributes` — not a new tool you can call from a Copilot session. What
+consumes it is another plugin.
+
+- **PATCH, not replace.** Keys you send are set, keys you omit are untouched, and a `null` value
+  removes a key. The merge happens in Postgres (`||` and `- key`), so two sessions patching
+  *different* keys concurrently don't clobber each other. Same-key writes are last-writer-wins.
+- **Writing another session's row needs `force: true`.** A trusted-mesh convention that makes the
+  dangerous call look dangerous — not an authorization boundary. Nothing stops you setting it.
+- **`machine` is effectively reserved.** `listAgents` overlays the transport-derived machine name on
+  top of whatever the session published, so a session cannot lie about which machine it is on — and
+  cannot use that key for anything else.
+- **They live exactly as long as the row does.** A graceful exit marks the session offline and *keeps*
+  the row, so a resumed session still has its attributes. The sweep is the real bound: agent rows go
+  after seven days (`AGENT_RELAY_PG_AGENT_TTL_DAYS`), and the attributes go with them.
+
 ## Security model
 
 For the **Azure / Entra** path:

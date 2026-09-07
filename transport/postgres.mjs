@@ -10,6 +10,48 @@
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Coerce an attributes bag to something `||` can merge.
+ *
+ * `setAttributes` validates its input; `register` took `identity.attributes` on
+ * trust, and this transport is duck-typed and self-contained, so it cannot assume
+ * core checked. Postgres treats a non-object operand of `||` as a single-element
+ * array, which turns the column into a jsonb ARRAY — after which merges append
+ * instead of merging, key removal silently does nothing, and there is no path back
+ * through any exposed operation.
+ *
+ * Checked on the SERIALISED form, because that is what actually reaches the database:
+ * an object carrying a `toJSON` returning an array passes every structural test here
+ * and still stringifies to `[…]`.
+ */
+function plainObject(value) {
+  try {
+    const parsed = JSON.parse(JSON.stringify(value ?? {}));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Keys this transport asserts itself, which a session therefore may not publish. */
+const RESERVED_KEYS = new Set(["machine"]);
+
+/**
+ * The attributes column as a *mergeable* expression.
+ *
+ * Mirrors core's guard on the local transport, and for the same reason: the read path
+ * tolerates a bad column value, so the write path must too, or the two disagree about
+ * whether one is survivable. `NOT NULL DEFAULT '{}'` makes NULL unreachable, but the
+ * jsonb TYPE is unconstrained — a foreign writer, or a direct UPDATE, can leave an
+ * array or a scalar there, and every subsequent operation would report success while
+ * making it worse.
+ */
+const VALID_ATTRIBUTES_OF = (table) => {
+  const col = table ? `${table}.attributes` : "attributes";
+  return `CASE WHEN jsonb_typeof(${col}) = 'object' THEN ${col} ELSE '{}'::jsonb END`;
+};
+const VALID_ATTRIBUTES = VALID_ATTRIBUTES_OF();
+
+/**
  * Cross-machine Transport: a shared PostgreSQL store + interval poll. The
  * cross-machine analogue of `sqlite-poll.mjs` — same two-table model (an `agents`
  * registry + a `messages` inbox), same contract, so the core is unchanged. Only
@@ -140,12 +182,16 @@ export function createPostgresTransport({
         identity.name = name; // core reads the chosen name live
       }
       await client.query(
-        `INSERT INTO agents (id, name, device_name, online, registered_at, last_heartbeat)
-         VALUES ($1, $2, $3, true, now(), now())
+        `INSERT INTO agents (id, name, device_name, online, registered_at, last_heartbeat, attributes)
+         VALUES ($1, $2, $3, true, now(), now(), $4::jsonb)
          ON CONFLICT (id) DO UPDATE
            SET name = excluded.name, device_name = excluded.device_name,
-               online = true, last_heartbeat = now()`,
-        [identity.id, name, machine ?? null],
+               online = true, last_heartbeat = now(),
+               -- MERGE, never replace. A resuming session supplies no attributes —
+               -- they live here, not in its configuration — so replacing would erase
+               -- everything it had published before anything could notice.
+               attributes = ${VALID_ATTRIBUTES_OF("agents")} || excluded.attributes`,
+        [identity.id, name, machine ?? null, JSON.stringify(plainObject(identity.attributes))],
       );
       await client.query("COMMIT");
     } catch (err) {
@@ -323,17 +369,89 @@ export function createPostgresTransport({
     async listAgents() {
       const rows = (
         await pool.query(
-          `SELECT id, name, device_name FROM agents
+          `SELECT id, name, device_name, ${VALID_ATTRIBUTES} AS attributes FROM agents
            WHERE online AND last_heartbeat >= now() - make_interval(secs => $1)
            ORDER BY name`,
           [staleSecs],
         )
       ).rows;
-      return rows.map((r) => ({
-        id: r.id,
-        name: r.name,
-        ...(r.device_name ? { attributes: { machine: r.device_name } } : {}),
-      }));
+      return rows.map((r) => {
+        // Session-published facts first, then the transport-derived ones — so a
+        // session cannot displace `machine`, which this transport asserts from its
+        // own column rather than taking anyone's word for.
+        const attributes = {
+          ...(r.attributes ?? {}),
+          ...(r.device_name ? { machine: r.device_name } : {}),
+        };
+        return {
+          id: r.id,
+          name: r.name,
+          ...(Object.keys(attributes).length ? { attributes } : {}),
+        };
+      });
+    },
+
+    /**
+     * PATCH one agent's attributes. Keys present are set, keys ABSENT are left alone,
+     * and a key whose value is NULL is removed.
+     *
+     * The merge is done **in Postgres** (`||` for the set, `- key` for the removals)
+     * rather than as a read-modify-write here, so two sessions patching different keys
+     * of the same row concurrently cannot clobber one another.
+     */
+    async setAttributes({ id, attributes, force = false } = {}) {
+      const target = id ?? self.id;
+      if (attributes == null || typeof attributes !== "object" || Array.isArray(attributes)) {
+        return { ok: false, error: "'attributes' must be an object" };
+      }
+      // Writing another session's row changes the state of something running that
+      // will not be told. Possible — this is a trusted mesh — but asked for, not default.
+      if (target !== self.id && !force) {
+        return {
+          ok: false,
+          error: `refusing to write attributes on another session (${target}) without force`,
+        };
+      }
+      // `machine` is asserted by this transport from its own column, so a session's
+      // write to it would persist, be echoed back as though it had taken effect, and
+      // then be invisible to every peer — including a `null` removal reporting that a
+      // key was cleared while everyone still sees it. That is the same "told a key was
+      // cleared when it was not" failure the undefined rule below exists to prevent,
+      // so it is refused rather than quietly overlaid.
+      const reserved = Object.keys(attributes).filter((k) => RESERVED_KEYS.has(k));
+      if (reserved.length) {
+        return {
+          ok: false,
+          error:
+            `'${reserved.join("', '")}' is reserved by the Postgres transport, which derives ` +
+            `it rather than taking a session's word for it. Publish under a different key.`,
+        };
+      }
+      // `undefined` is a removal too. It is not a value jsonb can hold, and
+      // JSON.stringify silently drops it — so treating it as a set produced an empty
+      // patch that still reported ok, telling a caller a key was cleared when it was
+      // not. A patch built from a lookup that missed is exactly how one arrives here.
+      const removals = Object.keys(attributes).filter((k) => attributes[k] == null);
+      const sets = Object.fromEntries(Object.entries(attributes).filter(([, v]) => v != null));
+      const res = await pool.query(
+        `UPDATE agents
+            SET attributes = (${VALID_ATTRIBUTES} || $2::jsonb) - $3::text[]
+          WHERE id = $1
+        RETURNING attributes`,
+        [target, JSON.stringify(sets), removals],
+      );
+      if (res.rowCount === 0) return { ok: false, error: `no such agent: ${target}` };
+      const stored = res.rows[0].attributes ?? {};
+      // Keep the in-memory identity in step with the row.
+      //
+      // The heartbeat re-registers when its UPDATE matches no row — a laptop waking,
+      // or a stall past staleMs — and `register` merges `identity.attributes` back in.
+      // Left stale, that object still holds keys this call has just DELETED, so they
+      // return unannounced. The merge is right; the stale source was the bug. Note the
+      // asymmetry that hides it: additions survive re-registration either way, so only
+      // removals are undone.
+      if (target === self.id) self.attributes = stored;
+      return { ok: true, attributes: stored };
     },
 
     async send(message) {
@@ -491,7 +609,7 @@ const ALIAS_LOCK_KEY = 498061002;
 const SWEEP_LOCK_KEY = 498061003;
 
 /** The schema version this transport build expects. */
-export const TARGET_SCHEMA = 1;
+export const TARGET_SCHEMA = 2;
 
 /**
  * Idempotent schema migration, serialized across machines with an advisory lock.
@@ -553,7 +671,17 @@ export async function migrate(pool, log = () => {}) {
       );
     }
 
-    // Future migrations: if (current < 2) { … }
+    if (current < 2) {
+      log("postgres: applying schema migration 2 (session attributes)");
+      // Deliberately ADDITIVE: a nullable column with a default. An older build
+      // selects explicit columns and never mentions this one, so it keeps working
+      // against an upgraded database — only a FRESH older start refuses, via the
+      // schema_version guard above. That is what makes a staggered upgrade across
+      // machines safe rather than a flag day.
+      await client.query(
+        `ALTER TABLE agents ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'`,
+      );
+    }
 
     await client.query(
       `INSERT INTO agent_relay_meta (key, value) VALUES ('schema_version', $1)
