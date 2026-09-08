@@ -45,7 +45,11 @@ test("host unreachable (ENOTFOUND) → UNREACHABLE", () => {
 });
 
 test("schema too new → SCHEMA_NEWER", () => {
-  const err = new Error("agent-relay: database schema_version 999 is newer than this build supports (1).");
+  const err = new Error(
+    "agent-relay: database schema_version 999 requires a build supporting at least 999, " +
+      "and this one supports 2. Upgrade the extension; refusing to run on a schema this " +
+      "build cannot read.",
+  );
   assert.equal(classify(err, env).code, EXIT.SCHEMA_NEWER);
 });
 

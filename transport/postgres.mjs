@@ -301,8 +301,8 @@ export function createPostgresTransport({
       // Connect-retry lives HERE: the transport owns its own connect resilience
       // (the entry no longer retries). A transient/slow initial connect is retried
       // a few times — each attempt bounded by the pool's connectionTimeoutMillis
-      // fast-fail — with a bounded backoff. A DETERMINISTIC schema-version error
-      // ("newer than this build") can't heal, so it is NOT retried. On terminal
+      // fast-fail — with a bounded backoff. A DETERMINISTIC schema failure
+      // (SchemaTooNewError) can't heal, so it is NOT retried. On terminal
       // failure the error propagates so the entry marks the relay inactive.
       const attempts = Math.max(1, connectMaxAttempts);
       for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -335,7 +335,9 @@ export function createPostgresTransport({
             /* already ended */
           }
           pool = null;
-          const deterministic = /newer than this build/i.test(err.message || "");
+          // Deterministic by TYPE, not by message text — a reworded error must not
+          // silently become retryable again.
+          const deterministic = err instanceof SchemaTooNewError;
           const isFinal = attempt === attempts;
           if (deterministic || isFinal) {
             if (isFinal && !deterministic && attempts > 1) {
@@ -608,8 +610,41 @@ const MIGRATE_LOCK_KEY = 498061001;
 const ALIAS_LOCK_KEY = 498061002;
 const SWEEP_LOCK_KEY = 498061003;
 
+/**
+ * Thrown when the database declares it needs a newer build than this one.
+ *
+ * A distinct type rather than a message: connect-retry has to tell a deterministic
+ * failure from a transient one, and matching thrown prose means any reword silently
+ * turns an un-healable error back into one that gets retried several times.
+ */
+export class SchemaTooNewError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SchemaTooNewError";
+  }
+}
+
 /** The schema version this transport build expects. */
 export const TARGET_SCHEMA = 2;
+
+/**
+ * The oldest build that can still read the schema this build writes.
+ *
+ * Two numbers rather than one, because "the database is newer than me" and "the
+ * database is newer than me in a way I cannot cope with" are different questions, and
+ * only the second is a reason to refuse.
+ *
+ * Every migration so far has been ADDITIVE — a column older builds never select — so
+ * an older build reads an upgraded database perfectly well. Refusing on
+ * `schema_version` alone locked those builds out anyway, which on a multi-machine mesh
+ * means upgrading one machine stops fresh sessions on every other one until they are
+ * upgraded too. A flag day, to protect against nothing.
+ *
+ * Raise this ONLY in a migration that genuinely breaks older readers: dropping or
+ * renaming a column they select, changing a type under them, or altering the meaning
+ * of existing data. Then the refusal is real, and says so.
+ */
+export const MIN_READER_SCHEMA = 1;
 
 /**
  * Idempotent schema migration, serialized across machines with an advisory lock.
@@ -628,15 +663,33 @@ export async function migrate(pool, log = () => {}) {
       `CREATE TABLE IF NOT EXISTS agent_relay_meta (key text PRIMARY KEY, value text NOT NULL)`,
     );
     const res = await client.query(
-      "SELECT value FROM agent_relay_meta WHERE key = 'schema_version'",
+      "SELECT key, value FROM agent_relay_meta WHERE key IN ('schema_version', 'min_reader_version')",
     );
-    const current = res.rows.length ? parseInt(res.rows[0].value, 10) : 0;
+    const meta = Object.fromEntries(res.rows.map((r) => [r.key, r.value]));
+    const current = meta.schema_version ? parseInt(meta.schema_version, 10) : 0;
+    // Absent on a database written before this key existed. Those schemas were all
+    // additive, so 1 is the truthful answer rather than a lenient guess.
+    const minReader = meta.min_reader_version ? parseInt(meta.min_reader_version, 10) : 1;
 
-    if (current > TARGET_SCHEMA) {
-      throw new Error(
-        `agent-relay: database schema_version ${current} is newer than this build supports ` +
-          `(${TARGET_SCHEMA}). Upgrade the extension; refusing to run on an unknown schema.`,
+    // Refuse only when the database says THIS build cannot read it — not merely
+    // because it is newer. An additive migration leaves min_reader_version alone, so
+    // an older build keeps working and a staggered upgrade is not a flag day.
+    if (current > TARGET_SCHEMA && minReader > TARGET_SCHEMA) {
+      throw new SchemaTooNewError(
+        `agent-relay: database schema_version ${current} requires a build supporting at least ` +
+          `${minReader}, and this one supports ${TARGET_SCHEMA}. Upgrade the extension; ` +
+          `refusing to run on a schema this build cannot read.`,
       );
+    }
+    if (current > TARGET_SCHEMA) {
+      // Newer, but declared readable. Do not migrate — a build cannot apply migrations
+      // it does not have — just use it.
+      log(
+        `postgres: database schema_version ${current} is newer than this build (${TARGET_SCHEMA}), ` +
+          `but readable by builds >= ${minReader} — continuing without migrating`,
+      );
+      await client.query("COMMIT");
+      return;
     }
 
     if (current < 1) {
@@ -687,6 +740,14 @@ export async function migrate(pool, log = () => {}) {
       `INSERT INTO agent_relay_meta (key, value) VALUES ('schema_version', $1)
        ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
       [String(TARGET_SCHEMA)],
+    );
+    // Only ever RAISED, never lowered: a newer build that reads this row must not
+    // relax a restriction an older one recorded, since the data it was protecting is
+    // still there.
+    await client.query(
+      `INSERT INTO agent_relay_meta (key, value) VALUES ('min_reader_version', $1)
+       ON CONFLICT (key) DO UPDATE SET value = GREATEST(agent_relay_meta.value::int, excluded.value::int)::text`,
+      [String(MIN_READER_SCHEMA)],
     );
     await client.query("COMMIT");
   } catch (err) {
