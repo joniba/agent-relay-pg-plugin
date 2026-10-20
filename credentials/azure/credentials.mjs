@@ -23,9 +23,17 @@
  *   tenant enforces MFA), so the token targets the server's tenant explicitly
  *   instead of relying on the `az` default context. Ignored when a `credential`
  *   is injected.
+ * @param {NodeJS.ProcessEnv} [opts.env] Environment to normalize; defaults to process.env.
+ * @param {(message: string) => void} [opts.log] Diagnostic logger; never receives token values.
  * @returns {CredentialProvider}
  */
-export function createAzureEntraCredentials({ credential, scope = PG_AAD_SCOPE, tenantId } = {}) {
+export function createAzureEntraCredentials({
+  credential,
+  scope = PG_AAD_SCOPE,
+  tenantId,
+  env = process.env,
+  log = () => {},
+} = {}) {
   // Construct the default credential lazily only when none is injected, so the
   // module stays unit-testable with a fake WITHOUT @azure/identity being
   // resolvable, and so the heavy SDK loads only on the real cross-machine path —
@@ -34,6 +42,7 @@ export function createAzureEntraCredentials({ credential, scope = PG_AAD_SCOPE, 
 
   return {
     async get() {
+      normalizeAgentSession(env, log);
       if (!source) source = await defaultCredential(tenantId);
       const result = await source.getToken(scope);
       const token = result && result.token;
@@ -47,6 +56,24 @@ export function createAzureEntraCredentials({ credential, scope = PG_AAD_SCOPE, 
 
 /** The Azure Database for PostgreSQL Microsoft Entra (AAD) OAuth scope. */
 export const PG_AAD_SCOPE = "https://ossrdbms-aad.database.windows.net/.default";
+
+function normalizeAgentSession(env, log) {
+  const agentSession = env.COPILOT_AGENT_SESSION_ID;
+  const validSession = /^[A-Za-z0-9._~-]{20,50}$/;
+  if (!agentSession || validSession.test(agentSession)) return;
+
+  // Some CLI builds inject a W3C traceparent here. Azure CLI forwards this as
+  // Entra's client_session, whose 50-character limit rejects the 55-character header.
+  const traceparent = /^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/i;
+  if (!traceparent.test(agentSession) || !validSession.test(env.SESSION_ID ?? "")) {
+    throw new Error(
+      "azure-entra credentials: invalid COPILOT_AGENT_SESSION_ID; " +
+        "a traceparent requires a valid canonical SESSION_ID",
+    );
+  }
+  env.COPILOT_AGENT_SESSION_ID = env.SESSION_ID;
+  log("azure-entra: corrected traceparent-shaped agent metadata using the canonical session id");
+}
 
 async function defaultCredential(tenantId) {
   const { DefaultAzureCredential } = await import("@azure/identity");

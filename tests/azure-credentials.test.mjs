@@ -63,3 +63,54 @@ test("returns a CredentialProvider-shaped object (has async get)", () => {
   const creds = createAzureEntraCredentials({ credential: fakeCredential("t") });
   assert.equal(typeof creds.get, "function");
 });
+
+test("get() replaces a traceparent with the canonical session id before acquiring a token", async () => {
+  const env = {
+    COPILOT_AGENT_SESSION_ID: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+    SESSION_ID: "12345678-1234-1234-1234-123456789abc",
+  };
+  const logs = [];
+  const creds = createAzureEntraCredentials({
+    env,
+    log: (message) => logs.push(message),
+    credential: {
+      async getToken() {
+        assert.equal(env.COPILOT_AGENT_SESSION_ID, env.SESSION_ID);
+        return { token: "token" };
+      },
+    },
+  });
+  await creds.get();
+  await creds.get();
+  assert.equal(logs.length, 1);
+  assert.ok(logs.every((message) => !message.includes(env.SESSION_ID)));
+});
+
+test("get() preserves valid agent-session metadata and an absent marker", async () => {
+  for (const env of [
+    {},
+    { COPILOT_AGENT_SESSION_ID: "existing-agent-session-id", SESSION_ID: "different-session-id-1234" },
+  ]) {
+    const before = { ...env };
+    const creds = createAzureEntraCredentials({ env, credential: fakeCredential("token") });
+    await creds.get();
+    assert.deepEqual(env, before);
+  }
+});
+
+test("get() refuses invalid agent metadata without dropping provenance or acquiring a token", async () => {
+  for (const env of [
+    { COPILOT_AGENT_SESSION_ID: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01" },
+    { COPILOT_AGENT_SESSION_ID: "invalid", SESSION_ID: "12345678-1234-1234-1234-123456789abc" },
+  ]) {
+    const before = { ...env };
+    let called = false;
+    const creds = createAzureEntraCredentials({
+      env,
+      credential: { async getToken() { called = true; return { token: "token" }; } },
+    });
+    await assert.rejects(() => creds.get(), /invalid COPILOT_AGENT_SESSION_ID/);
+    assert.equal(called, false);
+    assert.deepEqual(env, before);
+  }
+});

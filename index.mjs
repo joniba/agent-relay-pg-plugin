@@ -61,7 +61,11 @@ export default function createPgPlugin(ctx) {
     credentials: () =>
       env.AGENT_RELAY_PG_PASSWORD
         ? createEnvPasswordCredentials({ env })
-        : createAzureEntraCredentials({ tenantId: env.AGENT_RELAY_AZURE_TENANT }),
+        : createAzureEntraCredentials({
+            tenantId: env.AGENT_RELAY_AZURE_TENANT,
+            env,
+            log: ctx?.log,
+          }),
     interceptors: [
       {
         // Stamp the SENDER's machine onto the opaque meta bag (round-tripped by the

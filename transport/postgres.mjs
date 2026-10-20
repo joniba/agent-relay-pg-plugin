@@ -81,6 +81,8 @@ const VALID_ATTRIBUTES = VALID_ATTRIBUTES_OF();
  * @param {number} [opts.port]                 Default 5432.
  * @param {number} [opts.connectionTimeoutMillis] Per-connection acquire timeout so a
  *   blocked/slow connect fails fast instead of hanging boot (default 30000).
+ * @param {number} [opts.credentialTimeoutMillis] Separate startup credential deadline
+ *   (default 60000), completed before the first connection deadline starts.
  * @param {number} [opts.connectMaxAttempts]    How many times init() retries the
  *   initial connect before giving up (default 3). A deterministic schema-version
  *   error is never retried.
@@ -116,6 +118,7 @@ export function createPostgresTransport({
   machine,
   port = 5432,
   connectionTimeoutMillis = 30000,
+  credentialTimeoutMillis = 60000,
   connectMaxAttempts = 3,
   connectBackoffsMs = [2000, 4000],
   sleep = defaultSleep,
@@ -306,23 +309,47 @@ export function createPostgresTransport({
       // failure the error propagates so the entry marks the relay inactive.
       const attempts = Math.max(1, connectMaxAttempts);
       for (let attempt = 1; attempt <= attempts; attempt++) {
-        pool = new pg.Pool({
-          host,
-          user,
-          database,
-          port,
-          ssl,
-          // Async password from the Credentials seam → minted per NEW connection.
-          // For Azure this is a fresh Entra token; for local/dev a static env value.
-          password: async () => (await ctx.credentials.get()) ?? undefined,
-          max: 4,
-          maxLifetimeSeconds: 2700, // recycle connections before a token would expire
-          idleTimeoutMillis: 30000,
-          connectionTimeoutMillis,
-        });
-        // An idle-client error must never crash the host process.
-        pool.on("error", (err) => log(`pg pool error: ${err.message}`));
         try {
+          log("postgres: acquiring startup credentials");
+          let credentialTimer;
+          let startupPassword;
+          try {
+            startupPassword = await Promise.race([
+              ctx.credentials.get(),
+              new Promise((_, reject) => {
+                credentialTimer = setTimeout(
+                  () => reject(new Error(
+                    `postgres: startup credential acquisition timed out after ${credentialTimeoutMillis}ms`,
+                  )),
+                  credentialTimeoutMillis,
+                );
+              }),
+            ]);
+          } finally {
+            clearTimeout(credentialTimer);
+          }
+          log("postgres: startup credentials ready");
+          let useStartupPassword = true;
+          pool = new pg.Pool({
+            host,
+            user,
+            database,
+            port,
+            ssl,
+            password: async () => {
+              if (useStartupPassword) {
+                useStartupPassword = false;
+                return startupPassword ?? undefined;
+              }
+              return (await ctx.credentials.get()) ?? undefined;
+            },
+            max: 4,
+            maxLifetimeSeconds: 2700, // recycle connections before a token would expire
+            idleTimeoutMillis: 30000,
+            connectionTimeoutMillis,
+          });
+          // An idle-client error must never crash the host process.
+          pool.on("error", (err) => log(`pg pool error: ${err.message}`));
           await migrate(pool, log);
           return; // connected + schema ready
         } catch (err) {
@@ -330,7 +357,7 @@ export function createPostgresTransport({
           // …) — release the pool so a leaked idle client can't keep the process
           // alive, then decide whether to retry.
           try {
-            await pool.end();
+            if (pool) await pool.end();
           } catch {
             /* already ended */
           }

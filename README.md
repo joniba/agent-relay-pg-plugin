@@ -220,6 +220,17 @@ the local mesh (that would split your machines onto separate stores without tell
 - A transient **mid-session** blip is ridden out by the receive poll loop (it resumes on the next poll,
   no fallback); a `send_message` / `list_relay_agents` issued during the blip may just need retrying.
 
+Initial credentials have their own 60-second deadline, before PostgreSQL's 30-second connection
+deadline starts. The first connection uses that acquired credential; later connections still request
+fresh credentials. Logs distinguish credential acquisition from database connection failures.
+
+Some Copilot CLI builds pass a 55-character W3C trace header as `COPILOT_AGENT_SESSION_ID`.
+Azure CLI forwards that value as Entra's `client_session`, which rejects values longer than 50
+characters (`AADSTS901001`) and may leave Azure CLI waiting for browser login. For this known
+shape, the Entra provider corrects the extension process's metadata to its canonical `SESSION_ID`
+before acquiring credentials. Valid agent-session IDs are preserved; invalid metadata without a
+valid canonical session ID fails explicitly. Agent-session attribution is not disabled.
+
 A session-owned, advisory-lock-guarded sweep prunes old messages (> 24 h) and long-gone peers (> 7 d), so
 no always-on cleanup job is needed.
 
