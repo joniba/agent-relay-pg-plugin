@@ -112,13 +112,24 @@ test("startup cleans up a failed pool and acquires new credentials before retryi
   assert.deepEqual(pools.map((pool) => pool.passwords), [["token-1"], ["token-2"]]);
 });
 
-test("startup bounds credential acquisition and reports its own timeout", async (t) => {
+test("startup never retries a timed-out credential request that is still pending", async (t) => {
   const pools = fakePools(t);
-  const tx = transport(t, { credentialTimeoutMillis: 10 });
+  let calls = 0;
+  const backoffs = [];
+  const tx = transport(t, {
+    credentialTimeoutMillis: 10,
+    connectMaxAttempts: 3,
+    sleep: async (ms) => backoffs.push(ms),
+  });
   await assert.rejects(
-    tx.init({ self, credentials: { get: () => new Promise(() => {}) } }),
+    tx.init({
+      self,
+      credentials: { get() { calls += 1; return new Promise(() => {}); } },
+    }),
     /startup credential acquisition timed out after 10ms/,
   );
+  assert.equal(calls, 1, "an uncancelled authentication request must not overlap a retry");
+  assert.deepEqual(backoffs, []);
   assert.equal(pools.length, 0);
 });
 

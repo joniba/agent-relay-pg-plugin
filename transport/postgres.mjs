@@ -318,9 +318,7 @@ export function createPostgresTransport({
               ctx.credentials.get(),
               new Promise((_, reject) => {
                 credentialTimer = setTimeout(
-                  () => reject(new Error(
-                    `postgres: startup credential acquisition timed out after ${credentialTimeoutMillis}ms`,
-                  )),
+                  () => reject(new CredentialTimeoutError(credentialTimeoutMillis)),
                   credentialTimeoutMillis,
                 );
               }),
@@ -362,12 +360,12 @@ export function createPostgresTransport({
             /* already ended */
           }
           pool = null;
-          // Deterministic by TYPE, not by message text — a reworded error must not
-          // silently become retryable again.
-          const deterministic = err instanceof SchemaTooNewError;
+          // The credential seam cannot cancel a pending request. Retrying its
+          // deadline would leave multiple authentication operations running.
+          const cannotRetry = err instanceof SchemaTooNewError || err instanceof CredentialTimeoutError;
           const isFinal = attempt === attempts;
-          if (deterministic || isFinal) {
-            if (isFinal && !deterministic && attempts > 1) {
+          if (cannotRetry || isFinal) {
+            if (isFinal && !cannotRetry && attempts > 1) {
               log(
                 `postgres: connect failed after ${attempts} attempts — giving up (${err.message})`,
                 { level: "error" },
@@ -636,6 +634,16 @@ export function createPostgresTransport({
 const MIGRATE_LOCK_KEY = 498061001;
 const ALIAS_LOCK_KEY = 498061002;
 const SWEEP_LOCK_KEY = 498061003;
+
+class CredentialTimeoutError extends Error {
+  constructor(timeoutMillis) {
+    super(
+      `postgres: startup credential acquisition timed out after ${timeoutMillis}ms; ` +
+        "not retrying an authentication request that may still be running",
+    );
+    this.name = "CredentialTimeoutError";
+  }
+}
 
 /**
  * Thrown when the database declares it needs a newer build than this one.

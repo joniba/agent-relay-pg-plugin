@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 
 import {
   createAzureEntraCredentials,
@@ -113,4 +114,51 @@ test("get() refuses invalid agent metadata without dropping provenance or acquir
     assert.equal(called, false);
     assert.deepEqual(env, before);
   }
+});
+
+async function blockCredentialFallbacks(t) {
+  const { DefaultAzureCredential, AzurePowerShellCredential } = await import("@azure/identity");
+  return [DefaultAzureCredential, AzurePowerShellCredential].map((Credential) =>
+    t.mock.method(Credential.prototype, "getToken", async () => {
+      assert.fail(`Unexpected ${Credential.name} authentication`);
+    }),
+  );
+}
+
+test("default credentials use only Azure CLI with the requested tenant and a bounded process", async (t) => {
+  const fallbacks = await blockCredentialFallbacks(t);
+  const tenantId = "12345678-1234-1234-1234-123456789abc";
+  const commands = [];
+  t.mock.method(childProcess, "exec", (command, options, callback) => {
+    commands.push(command);
+    assert.equal(options.timeout, 30_000);
+    callback(null, JSON.stringify({ accessToken: "cli-token", expires_on: 4_070_908_800 }), "");
+  });
+  const creds = createAzureEntraCredentials({ tenantId, env: {} });
+
+  assert.equal(await creds.get(), "cli-token");
+  assert.equal(commands.length, 1);
+  assert.match(commands[0], /^az account get-access-token /);
+  assert.ok(commands[0].includes(`--tenant ${tenantId}`));
+  assert.ok(commands[0].includes("--resource https://ossrdbms-aad.database.windows.net"));
+  for (const fallback of fallbacks) assert.equal(fallback.mock.callCount(), 0);
+});
+
+test("missing CLI or expired login fails without falling back to other Azure credentials", async (t) => {
+  const fallbacks = await blockCredentialFallbacks(t);
+  let stderr;
+  const exec = t.mock.method(childProcess, "exec", (_command, _options, callback) => {
+    callback(new Error("CLI command failed"), "", stderr);
+  });
+  const creds = createAzureEntraCredentials({ env: {} });
+
+  for (const failure of [
+    { stderr: "'az' is not recognized as an internal or external command.", expected: /Azure CLI could not be found/ },
+    { stderr: "Please run 'az login' to set up an account.", expected: /az login/ },
+  ]) {
+    stderr = failure.stderr;
+    await assert.rejects(() => creds.get(), failure.expected);
+  }
+  assert.equal(exec.mock.callCount(), 2);
+  for (const fallback of fallbacks) assert.equal(fallback.mock.callCount(), 0);
 });

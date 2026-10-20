@@ -14,8 +14,9 @@
  *
  * @param {object} [opts]
  * @param {{ getToken: (scope: string|string[]) => Promise<{ token: string } | null> }} [opts.credential]
- *   The underlying Azure token source. Defaults to `DefaultAzureCredential`
- *   (honors `az login`, env vars, managed identity, …). Inject a fake in tests.
+ *   The underlying Azure token source. Defaults to `AzureCliCredential`, using
+ *   the existing `az login` context with a 30-second command timeout. There is
+ *   no automatic fallback to PowerShell or other credentials. Inject a fake in tests.
  * @param {string} [opts.scope]  OAuth scope for the token. Defaults to the
  *   Azure Database for PostgreSQL AAD scope.
  * @param {string} [opts.tenantId]  Microsoft Entra tenant to acquire the token
@@ -76,6 +77,6 @@ function normalizeAgentSession(env, log) {
 }
 
 async function defaultCredential(tenantId) {
-  const { DefaultAzureCredential } = await import("@azure/identity");
-  return new DefaultAzureCredential(tenantId ? { tenantId } : undefined);
+  const { AzureCliCredential } = await import("@azure/identity");
+  return new AzureCliCredential({ tenantId, processTimeoutInMs: 30_000 });
 }

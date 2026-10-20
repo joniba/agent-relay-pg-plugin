@@ -30,6 +30,10 @@ it does **not** configure the connection — you do that once (below).
 
 > **Requirements:** Node 22.5+, **Git** on PATH (core clones this repo), and a reachable Postgres
 > (Azure Database for PostgreSQL for the Entra path).
+> Entra authentication also requires **Azure CLI (`az`) on PATH**, already signed in as the intended
+> database user. The plugin uses only that CLI context, not automatic PowerShell or other credential
+> fallbacks. A missing CLI, expired login, or tenant mismatch is reported as an authentication error;
+> the plugin does not run `az login` for you. Password-based local/CI setup is unchanged.
 
 ### Configure the connection (one-time)
 
@@ -222,7 +226,12 @@ the local mesh (that would split your machines onto separate stores without tell
 
 Initial credentials have their own 60-second deadline, before PostgreSQL's 30-second connection
 deadline starts. The first connection uses that acquired credential; later connections still request
-fresh credentials. Logs distinguish credential acquisition from database connection failures.
+fresh credentials. Each Azure CLI token command has a 30-second subprocess timeout. Logs distinguish
+credential acquisition from database connection failures. If the startup credential deadline expires,
+startup fails without retrying: the credential interface cannot cancel the original request, so a
+retry could overlap unfinished authentication. This does not claim that the deadline cancels that
+request. Ordinary completed credential failures and transient connection failures retain their
+bounded retries.
 
 Some Copilot CLI builds pass a 55-character W3C trace header as `COPILOT_AGENT_SESSION_ID`.
 Azure CLI forwards that value as Entra's `client_session`, which rejects values longer than 50

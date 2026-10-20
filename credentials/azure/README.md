@@ -55,8 +55,14 @@ import swap.
 - **No IP allowlist is relied upon** — the security boundary is authentication,
   not network location (egress IPs can rotate). Public network access stays on,
   gated by Entra.
-- The token is minted **locally on each machine** via the user's `az login` /
-  environment (`DefaultAzureCredential`). Tokens are never stored or transferred.
+- The token is minted **locally on each machine** from the existing Azure CLI login
+  (`AzureCliCredential`). `az` must be on PATH and signed in as the intended database
+  user, using the configured tenant where provided. Each CLI token command has a
+  30-second timeout. The provider does not initiate login or fall back to Azure
+  PowerShell, browser-broker authentication, environment credentials or managed
+  identity. Missing/expired CLI authentication fails explicitly. Injected credentials
+  remain available for tests or deliberate integrations. Tokens are never stored
+  or transferred by the plugin.
 
 ## Provisioning & lifecycle
 
