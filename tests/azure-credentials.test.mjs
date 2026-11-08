@@ -113,9 +113,21 @@ test("a failed acquisition is shared, then a completed failure can be retried", 
       },
     },
   });
+
   const results = await Promise.allSettled([creds.get(), creds.get()]);
   assert.ok(results.every(result => result.status === "rejected"));
   assert.equal(calls, 1);
   assert.equal(await creds.get(), "replacement");
   assert.equal(calls, 2);
+});
+
+test("authorization failure diagnostics do not contain private exception text", async () => {
+  const lines = [];
+  const creds = createAzureEntraCredentials({
+    credential: { getToken: async () => { throw new Error("private-user private-token"); } },
+    log: line => lines.push(line),
+  });
+  await assert.rejects(creds.get(), /private-user/);
+  assert.ok(lines.some(line => line.includes("reason=authorization failed")));
+  assert.ok(lines.every(line => !/private-user|private-token/.test(line)));
 });

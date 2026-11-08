@@ -9,6 +9,17 @@
 
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function databaseFailureReason(error) {
+  const code = error?.code;
+  if (["ENOTFOUND", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "AGENT_RELAY_AUTH_TIMEOUT"].includes(code)) {
+    return code;
+  }
+  if (typeof code === "string" && /^\d[0-9A-Z]{4}$/.test(code)) return `SQLSTATE ${code}`;
+  if (error instanceof SchemaTooNewError) return "database schema is not readable by this version";
+  if (/timeout|timed out/i.test(String(error?.message ?? ""))) return "database connection timed out";
+  return "database operation failed";
+}
+
 /**
  * Coerce an attributes bag to something `||` can merge.
  *
@@ -259,7 +270,7 @@ export function createPostgresTransport({
       return { swept: true, messages: msgs.rowCount, agents: agents.rowCount };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
-      log(`postgres sweep error: ${err.message}`);
+      log(`postgres sweep error: ${databaseFailureReason(err)}`);
       return { swept: false, error: err.message };
     } finally {
       client.release();
@@ -334,7 +345,7 @@ export function createPostgresTransport({
             idleTimeoutMillis: 30000,
             connectionTimeoutMillis,
           });
-          pool.on("error", (err) => log(`pg pool error: ${err.message}`));
+          pool.on("error", (err) => log(`pg pool error: ${databaseFailureReason(err)}`));
           const connectionStarted = Date.now();
           await migrate(pool, log);
           log(`postgres: database connection ready elapsed_ms=${Date.now() - connectionStarted}`);
@@ -357,14 +368,14 @@ export function createPostgresTransport({
           if (deterministic || isFinal) {
             if (isFinal && !deterministic && attempts > 1) {
               log(
-                `postgres: connect failed after ${attempts} attempts — giving up (${err.message})`,
+                `postgres: connect failed after ${attempts} attempts — giving up (${databaseFailureReason(err)})`,
                 { level: "error" },
               );
             }
             throw err;
           }
           log(
-            `postgres: connect failed (attempt ${attempt}/${attempts}) — retrying (${err.message})`,
+            `postgres: connect failed (attempt ${attempt}/${attempts}) — retrying (${databaseFailureReason(err)})`,
             { level: "warning" },
           );
           const backoff = connectBackoffsMs[attempt - 1] ?? 0;
@@ -593,7 +604,7 @@ export function createPostgresTransport({
         } catch (error) {
           failedPolls++;
           const delay = Math.min(60_000, pollIntervalMs * 2 ** Math.min(failedPolls, 5));
-          log(`postgres poll failed attempt=${failedPolls} next_retry_ms=${delay} reason=${error.message}`, {
+          log(`postgres poll failed attempt=${failedPolls} next_retry_ms=${delay} reason=${databaseFailureReason(error)}`, {
             level: "warning",
           });
         } finally {

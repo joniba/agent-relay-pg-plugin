@@ -1,5 +1,18 @@
 import { createAzureCliTokenSource, AUTHORIZATION_TIMEOUT_MS } from "./cli-token-source.mjs";
 
+function authorizationFailureReason(error) {
+  const message = String(error?.message ?? "");
+  const aad = message.match(/\bAADSTS\d+\b/)?.[0];
+  if (aad) return aad;
+  if (error?.code === "AGENT_RELAY_AUTH_TIMEOUT") return "authorization deadline exceeded";
+  if (/cancelled|closed/i.test(message)) return "authorization cancelled";
+  if (/expired/i.test(message)) return "authorization expired";
+  if (/sign-in|az login/i.test(message)) return "Azure CLI sign-in requires attention";
+  if (/not found.*PATH/i.test(message)) return "Azure CLI unavailable in this session";
+  if (/invalid|no valid token|no token/i.test(message)) return "invalid authorization response";
+  return "authorization failed";
+}
+
 /**
  * Azure Entra CredentialProvider — mints a PostgreSQL-scoped Microsoft Entra
  * access token for the Postgres transport to use as its connection password.
@@ -58,7 +71,7 @@ export function createAzureEntraCredentials({
             log(`authorization acquired elapsed_ms=${clock() - started} cacheable=${!!cached}`);
             return result.token;
           } catch (error) {
-            log(`authorization request failed elapsed_ms=${clock() - started} reason=${error.message}`, { level: "warning" });
+            log(`authorization request failed elapsed_ms=${clock() - started} reason=${authorizationFailureReason(error)}`, { level: "warning" });
             throw error;
           }
         });

@@ -90,7 +90,7 @@ test("poll failures are logged, delay later attempts, recover, and stop cleanly"
         }
         async query() {
           polls++;
-          if (failing) throw new Error("test database connection failure");
+          if (failing) throw new Error("private-user private-database");
           return { rowCount: 1, rows: [] };
         }
         async end() {}
@@ -108,7 +108,8 @@ test("poll failures are logged, delay later attempts, recover, and stop cleanly"
     t.mock.timers.tick(10);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(polls, 1);
-    assert.ok(lines.some(line => /poll failed.*next_retry_ms=20.*test database connection failure/.test(line)));
+    assert.ok(lines.some(line => /poll failed.*next_retry_ms=20.*database operation failed/.test(line)));
+    assert.ok(lines.every(line => !/private-user|private-database/.test(line)));
     t.mock.timers.tick(19);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(polls, 1);
