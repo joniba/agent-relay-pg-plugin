@@ -155,6 +155,8 @@ export function createPostgresTransport({
   let stopped = false;
   let deregistered = false;
   let lastHeartbeat = 0;
+  let credentials = null;
+  let failedPolls = 0;
 
   // ── alias collision resolution (advisory-locked, cross-machine atomic) ──────
   async function register(identity) {
@@ -284,6 +286,7 @@ export function createPostgresTransport({
   return {
     async init(ctx) {
       self = ctx.self;
+      credentials = ctx.credentials;
       // Load `pg` on demand. If it isn't installed, this is the cross-machine
       // opt-in path without its dependency — surface a clear, actionable error
       // (the entry then surfaces the failure and the relay goes inactive).
@@ -306,38 +309,50 @@ export function createPostgresTransport({
       // failure the error propagates so the entry marks the relay inactive.
       const attempts = Math.max(1, connectMaxAttempts);
       for (let attempt = 1; attempt <= attempts; attempt++) {
-        pool = new pg.Pool({
-          host,
-          user,
-          database,
-          port,
-          ssl,
-          // Async password from the Credentials seam → minted per NEW connection.
-          // For Azure this is a fresh Entra token; for local/dev a static env value.
-          password: async () => (await ctx.credentials.get()) ?? undefined,
-          max: 4,
-          maxLifetimeSeconds: 2700, // recycle connections before a token would expire
-          idleTimeoutMillis: 30000,
-          connectionTimeoutMillis,
-        });
-        // An idle-client error must never crash the host process.
-        pool.on("error", (err) => log(`pg pool error: ${err.message}`));
         try {
+          const authorizationStarted = Date.now();
+          log(`postgres: acquiring authorization before connection attempt=${attempt}`);
+          let initialPassword = await credentials.get();
+          if (stopped) throw new Error("postgres transport stopped during authorization");
+          log(`postgres: authorization ready elapsed_ms=${Date.now() - authorizationStarted}; starting database timer`);
+          pool = new pg.Pool({
+            host,
+            user,
+            database,
+            port,
+            ssl,
+            password: async () => {
+              if (initialPassword != null) {
+                const password = initialPassword;
+                initialPassword = null;
+                return password;
+              }
+              return (await credentials.get()) ?? undefined;
+            },
+            max: 4,
+            maxLifetimeSeconds: 2700, // recycle connections before a token would expire
+            idleTimeoutMillis: 30000,
+            connectionTimeoutMillis,
+          });
+          pool.on("error", (err) => log(`pg pool error: ${err.message}`));
+          const connectionStarted = Date.now();
           await migrate(pool, log);
+          log(`postgres: database connection ready elapsed_ms=${Date.now() - connectionStarted}`);
           return; // connected + schema ready
         } catch (err) {
           // This attempt failed (unreachable host, bad creds, refuse-newer schema,
           // …) — release the pool so a leaked idle client can't keep the process
           // alive, then decide whether to retry.
           try {
-            await pool.end();
+            await pool?.end();
           } catch {
             /* already ended */
           }
           pool = null;
           // Deterministic by TYPE, not by message text — a reworded error must not
           // silently become retryable again.
-          const deterministic = err instanceof SchemaTooNewError;
+          const deterministic = err instanceof SchemaTooNewError ||
+            err.code === "AGENT_RELAY_AUTH_TIMEOUT" || stopped;
           const isFinal = attempt === attempts;
           if (deterministic || isFinal) {
             if (isFinal && !deterministic && attempts > 1) {
@@ -497,6 +512,12 @@ export function createPostgresTransport({
     },
 
     startReceiving(onMessage) {
+      const schedule = () => {
+        if (stopped) return;
+        const delay = Math.min(60_000, pollIntervalMs * 2 ** Math.min(failedPolls, 5));
+        timer = setTimeout(() => void drain(), delay);
+        timer.unref?.();
+      };
       const drain = async () => {
         if (draining || stopped) return;
         draining = true;
@@ -567,16 +588,21 @@ export function createPostgresTransport({
               // DB hiccup — leave the row (lease expires → retried). At-least-once.
             }
           }
-        } catch {
-          // A cycle hit a transient error — swallow; the transport must survive a
-          // cycle (the poll naturally retries).
+          if (failedPolls) log(`postgres poll recovered after ${failedPolls} failed attempt(s)`);
+          failedPolls = 0;
+        } catch (error) {
+          failedPolls++;
+          const delay = Math.min(60_000, pollIntervalMs * 2 ** Math.min(failedPolls, 5));
+          log(`postgres poll failed attempt=${failedPolls} next_retry_ms=${delay} reason=${error.message}`, {
+            level: "warning",
+          });
         } finally {
           draining = false;
+          schedule();
         }
       };
 
-      timer = setInterval(() => void drain(), pollIntervalMs);
-      if (typeof timer.unref === "function") timer.unref();
+      schedule();
       scheduleSweep();
     },
 
@@ -585,13 +611,14 @@ export function createPostgresTransport({
     async stop() {
       stopped = true;
       if (timer) {
-        clearInterval(timer);
+        clearTimeout(timer);
         timer = null;
       }
       if (sweepTimer) {
         clearTimeout(sweepTimer);
         sweepTimer = null;
       }
+      await credentials?.close?.();
       while (draining) await new Promise((r) => setTimeout(r, 5));
       if (pool) {
         try {

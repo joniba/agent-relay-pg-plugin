@@ -1,6 +1,6 @@
 # agent-relay — Azure lib
 
-The **only** Azure-aware code in agent-relay. Everything that depends on Azure — the `@azure/identity` credential adapter and
+The **only** Azure-aware code in agent-relay. Everything that depends on Azure — the Azure CLI credential adapter and
 the Microsoft Entra token scope — lives in **this folder**. Its **companion
 provisioning script** is `scripts/provision-azure.ps1` (a sibling, kept as a
 shell script because it runs `az`); it is part of the Azure surface and is taken
@@ -13,6 +13,7 @@ isolated so it can be **lifted out into a separate repo or npm package** later
 | File | Role |
 |---|---|
 | `credentials.mjs` | `createAzureEntraCredentials()` → a `CredentialProvider` whose `get()` mints a PostgreSQL-scoped Microsoft Entra access token. |
+| `cli-token-source.mjs` | Runs existing Azure CLI authorization with a separate deadline and stops its own program on cancellation. |
 | `index.mjs` | The stable public surface (re-exports). Import the lib only through this. |
 
 The companion provisioning script lives at `scripts/provision-azure.ps1` (it runs
@@ -32,10 +33,11 @@ import { createAzureEntraCredentials } from "./azure/index.mjs";
 credentials: () => createAzureEntraCredentials({ tenantId: env.AGENT_RELAY_AZURE_TENANT }),
 ```
 
-`pg` accepts an async function for its `password`, so the transport calls
-`credentials.get()` per new connection and always authenticates with a fresh
-token. Password auth on the server is disabled; the token + TLS is the security
-boundary.
+The transport obtains initial authorization before constructing its connection pool.
+Later connections call `credentials.get()`, which shares an active request or reuses
+an unexpired token until five minutes before expiry. Tokens without a reliable expiry
+are not cached. The provider's optional `close()` cancels its active program.
+Password auth on the server is disabled; the token + TLS is the security boundary.
 
 ## How to extract later
 
@@ -44,7 +46,7 @@ boundary.
 3. In agent-relay, replace `import … from "./azure/index.mjs"` with the package
    name. Nothing else references Azure — the transport and core are untouched.
 
-Because every `@azure/*` import is confined to this folder and the rest of the
+Because every Azure authorization operation is confined to this folder and the rest of the
 code depends only on the Credentials seam, extraction is a folder move plus one
 import swap.
 
@@ -55,8 +57,14 @@ import swap.
 - **No IP allowlist is relied upon** — the security boundary is authentication,
   not network location (egress IPs can rotate). Public network access stays on,
   gated by Entra.
-- The token is minted **locally on each machine** via the user's `az login` /
-  environment (`DefaultAzureCredential`). Tokens are never stored or transferred.
+- The token is minted **locally on each machine** through the existing Azure CLI
+  login. Automatic fallback to other credential providers is not used. Tokens
+  are cached only in memory and never stored or transferred between machines.
+- The authorization program has a 180-second deadline. On Windows, the standard
+  MSI launcher's Python program is executed directly rather than through a shell.
+  A timed-out request is not considered finished until that program has exited.
+- Diagnostic logs contain elapsed times, process IDs, and classified failures,
+  not tokens, command output, or account identifiers.
 
 ## Provisioning & lifecycle
 

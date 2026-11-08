@@ -63,3 +63,59 @@ test("returns a CredentialProvider-shaped object (has async get)", () => {
   const creds = createAzureEntraCredentials({ credential: fakeCredential("t") });
   assert.equal(typeof creds.get, "function");
 });
+
+test("concurrent requests share one acquisition and immediate reuse uses the cache", async () => {
+  let calls = 0;
+  let release;
+  const result = new Promise(resolve => { release = resolve; });
+  const lines = [];
+  const creds = createAzureEntraCredentials({
+    credential: { getToken: async () => { calls++; return result; } },
+    log: message => lines.push(message),
+  });
+  const requests = [creds.get(), creds.get(), creds.get(), creds.get()];
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  release({ token: "test-token", expiresOnTimestamp: Date.now() + 3_600_000 });
+  assert.deepEqual(await Promise.all(requests), Array(4).fill("test-token"));
+  assert.equal(await creds.get(), "test-token");
+  assert.equal(calls, 1);
+  assert.ok(lines.some(line => line.includes("request joined")));
+  assert.ok(lines.some(line => line.includes("cache hit")));
+  assert.ok(lines.every(line => !line.includes("test-token")));
+});
+
+test("refreshes before expiry and never returns an expired replacement", async () => {
+  let now = Date.now();
+  let calls = 0;
+  const creds = createAzureEntraCredentials({
+    clock: () => now,
+    credential: {
+      async getToken() {
+        calls++;
+        return { token: `token-${calls}`, expiresOnTimestamp: calls === 1 ? now + 600_000 : now - 1 };
+      },
+    },
+  });
+  assert.equal(await creds.get(), "token-1");
+  now += 300_001;
+  await assert.rejects(creds.get(), /expired token/);
+  assert.equal(calls, 2);
+});
+
+test("a failed acquisition is shared, then a completed failure can be retried", async () => {
+  let calls = 0;
+  const creds = createAzureEntraCredentials({
+    credential: {
+      async getToken() {
+        if (++calls === 1) throw new Error("test authorization failure");
+        return { token: "replacement", expiresOnTimestamp: Date.now() + 600_000 };
+      },
+    },
+  });
+  const results = await Promise.allSettled([creds.get(), creds.get()]);
+  assert.ok(results.every(result => result.status === "rejected"));
+  assert.equal(calls, 1);
+  assert.equal(await creds.get(), "replacement");
+  assert.equal(calls, 2);
+});

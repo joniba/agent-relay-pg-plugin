@@ -1,3 +1,5 @@
+import { createAzureCliTokenSource, AUTHORIZATION_TIMEOUT_MS } from "./cli-token-source.mjs";
+
 /**
  * Azure Entra CredentialProvider — mints a PostgreSQL-scoped Microsoft Entra
  * access token for the Postgres transport to use as its connection password.
@@ -9,13 +11,12 @@
  *
  * Honors the {@link CredentialProvider} shape:
  * `get()` resolves to the raw token string (the transport passes it as the `pg`
- * connection password). Returns a fresh token each call, so a caller that invokes
- * `get()` per new connection always authenticates with a current token.
+ * connection password). Reuses unexpired tokens and shares concurrent acquisition.
  *
  * @param {object} [opts]
  * @param {{ getToken: (scope: string|string[]) => Promise<{ token: string } | null> }} [opts.credential]
- *   The underlying Azure token source. Defaults to `DefaultAzureCredential`
- *   (honors `az login`, env vars, managed identity, …). Inject a fake in tests.
+ *   The underlying Azure token source. Defaults to the existing Azure CLI login.
+ *   Inject a fake in tests.
  * @param {string} [opts.scope]  OAuth scope for the token. Defaults to the
  *   Azure Database for PostgreSQL AAD scope.
  * @param {string} [opts.tenantId]  Microsoft Entra tenant to acquire the token
@@ -25,30 +26,59 @@
  *   is injected.
  * @returns {CredentialProvider}
  */
-export function createAzureEntraCredentials({ credential, scope = PG_AAD_SCOPE, tenantId } = {}) {
-  // Construct the default credential lazily only when none is injected, so the
-  // module stays unit-testable with a fake WITHOUT @azure/identity being
-  // resolvable, and so the heavy SDK loads only on the real cross-machine path —
-  // never on the local default.
-  let source = credential ?? null;
+export function createAzureEntraCredentials({
+  credential, scope = PG_AAD_SCOPE, tenantId, env = process.env,
+  log = () => {}, clock = Date.now, timeoutMs = AUTHORIZATION_TIMEOUT_MS,
+} = {}) {
+  const source = credential ?? createAzureCliTokenSource({ tenantId, env, log, timeoutMs });
+  let cached = null;
+  let acquiring = null;
+  let closed = false;
 
   return {
     async get() {
-      if (!source) source = await defaultCredential(tenantId);
-      const result = await source.getToken(scope);
-      const token = result && result.token;
-      if (!token) {
-        throw new Error("azure-entra credentials: token acquisition returned no token");
+      if (closed) throw new Error("Azure authorization provider is closed");
+      if (cached && cached.expiresOnTimestamp > clock() + 300_000) {
+        log(`authorization cache hit remaining_ms=${cached.expiresOnTimestamp - clock()}`, { level: "debug" });
+        return cached.token;
       }
-      return token;
+      if (!acquiring) {
+        acquiring = Promise.resolve().then(async () => {
+          const started = clock();
+          log("authorization request started");
+          try {
+            const result = await source.getToken(scope);
+            if (!result?.token) throw new Error("azure-entra credentials: token acquisition returned no token");
+            if (closed) throw new Error("Azure authorization provider closed before acquisition finished");
+            const remaining = result.expiresOnTimestamp - clock();
+            cached = Number.isFinite(remaining) && remaining > 300_000 ? result : null;
+            if (Number.isFinite(remaining) && remaining <= 0) {
+              throw new Error("Azure authorization returned an expired token");
+            }
+            log(`authorization acquired elapsed_ms=${clock() - started} cacheable=${!!cached}`);
+            return result.token;
+          } catch (error) {
+            log(`authorization request failed elapsed_ms=${clock() - started} reason=${error.message}`, { level: "warning" });
+            throw error;
+          }
+        });
+      } else {
+        log("authorization request joined; no additional process started", { level: "debug" });
+      }
+      const request = acquiring;
+      try {
+        return await request;
+      } finally {
+        if (acquiring === request) acquiring = null;
+      }
+    },
+    async close() {
+      closed = true;
+      cached = null;
+      await source.close?.();
     },
   };
 }
 
 /** The Azure Database for PostgreSQL Microsoft Entra (AAD) OAuth scope. */
 export const PG_AAD_SCOPE = "https://ossrdbms-aad.database.windows.net/.default";
-
-async function defaultCredential(tenantId) {
-  const { DefaultAzureCredential } = await import("@azure/identity");
-  return new DefaultAzureCredential(tenantId ? { tenantId } : undefined);
-}

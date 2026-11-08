@@ -55,6 +55,22 @@ locally at runtime (tokens are never written to config/logs or copied between ma
 az login        # sign in as AGENT_RELAY_PG_USER
 ```
 
+The default authorization provider uses this existing Azure CLI login only; it does not
+fall back to PowerShell, managed identity, or environment credentials. On Windows, the
+standard MSI Azure CLI Python program runs directly, without an intermediate command
+shell, so a timed-out request cannot leave its Python program running.
+
+Authorization has its own 180-second limit and completes before the 30-second database
+connection timer starts. Concurrent authorization requests share one running program.
+Tokens are reused in memory until five minutes before their reported expiry; they are
+never saved to disk. A timeout stops the program and is not retried during startup.
+Database polling failures are reported and retried with increasing delays, up to one minute.
+
+The relay log records authorization starts, program process IDs, elapsed times, shared
+requests, cache hits, connection timing, and polling recovery. It never records token
+values, command output, or connection passwords. After updating an installed plugin,
+reload only the selected sessions, one at a time, and verify an actual remote roster.
+
 **Local / CI (password auth, no Azure)** — TLS off, password instead of Entra (throwaway DBs only):
 
 ```ini
@@ -105,8 +121,8 @@ machines (also running this plugin against the same DB) become reachable via `se
 This package is a normal agent-relay **plugin**: a default-export factory (`index.mjs`) returning a
 Registration that declares a `transport` (Postgres; its `init()` owns the connect-retry), `credentials`
 (Entra token provider, or env-password for local/CI), and an `interceptor` (re-adds the machine label to
-the wake header + roster). It depends only on what it imports (`pg`, `@azure/identity`) — **core is not a
-dependency**; the installer git-clones it.
+the wake header + roster). The transport uses `pg`; default authorization uses Azure CLI
+without importing the Azure identity SDK. **Core is not a dependency**; the installer git-clones it.
 
 The installer copies a strict **runtime allowlist** into the plugin folder — `package.json`, `index.mjs`,
 `env-file.mjs`, `transport/`, `credentials/`, and the installed `node_modules/` — and nothing else (no

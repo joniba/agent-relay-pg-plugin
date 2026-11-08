@@ -38,7 +38,7 @@ function stripControl(s) {
  * @returns {object} a Registration { name, transport, credentials, interceptors }
  */
 export default function createPgPlugin(ctx) {
-  const { env = process.env } = ctx ?? {};
+  const { env = process.env, log = () => {} } = ctx ?? {};
   // This session's machine label — provided by the PLUGIN (core has no machine
   // concept). Used to stamp outbound provenance and to tag this session's roster row.
   const machine = env.AGENT_RELAY_HOST || hostname();
@@ -61,7 +61,7 @@ export default function createPgPlugin(ctx) {
     credentials: () =>
       env.AGENT_RELAY_PG_PASSWORD
         ? createEnvPasswordCredentials({ env })
-        : createAzureEntraCredentials({ tenantId: env.AGENT_RELAY_AZURE_TENANT }),
+        : createAzureEntraCredentials({ tenantId: env.AGENT_RELAY_AZURE_TENANT, env, log }),
     interceptors: [
       {
         // Stamp the SENDER's machine onto the opaque meta bag (round-tripped by the
