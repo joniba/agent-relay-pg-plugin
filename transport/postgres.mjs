@@ -107,6 +107,7 @@ const VALID_ATTRIBUTES = VALID_ATTRIBUTES_OF();
  *   provides it (core is machine-agnostic); it is stored as the agent's
  *   `device_name` and surfaced on `listAgents` entries as `attributes.machine`.
  * @param {Logger} [opts.log]   Optional diagnostic logger.
+ * @param {() => Promise<object>} [opts.loadPg] Lazy module loader, injectable for tests.
  * @returns {Transport}
  */
 export function createPostgresTransport({
@@ -130,6 +131,7 @@ export function createPostgresTransport({
   messageTtlMs = 86_400_000,
   agentRetentionMs = 604_800_000,
   log = () => {},
+  loadPg = () => import("pg"),
   debug = false,
 } = {}) {
   if (!host) throw new Error("postgres transport requires a host");
@@ -155,6 +157,7 @@ export function createPostgresTransport({
   let stopped = false;
   let deregistered = false;
   let lastHeartbeat = 0;
+  let onRegistered;
 
   // ── alias collision resolution (advisory-locked, cross-machine atomic) ──────
   async function register(identity) {
@@ -179,7 +182,6 @@ export function createPostgresTransport({
           ).rows.map((r) => r.name),
         );
         name = candidates.find((c) => !taken.has(c)) ?? candidates[0];
-        identity.name = name; // core reads the chosen name live
       }
       await client.query(
         `INSERT INTO agents (id, name, device_name, online, registered_at, last_heartbeat, attributes)
@@ -194,12 +196,14 @@ export function createPostgresTransport({
         [identity.id, name, machine ?? null, JSON.stringify(plainObject(identity.attributes))],
       );
       await client.query("COMMIT");
+      identity.name = name; // publish only the committed identity
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
     } finally {
       client.release();
     }
+    onRegistered?.(identity);
   }
 
   function toMessage(row) {
@@ -284,12 +288,13 @@ export function createPostgresTransport({
   return {
     async init(ctx) {
       self = ctx.self;
+      onRegistered = ctx.onRegistered;
       // Load `pg` on demand. If it isn't installed, this is the cross-machine
       // opt-in path without its dependency — surface a clear, actionable error
       // (the entry then surfaces the failure and the relay goes inactive).
       if (!pg) {
         try {
-          pg = (await import("pg")).default;
+          pg = (await loadPg()).default;
         } catch (err) {
           throw new Error(
             "the 'postgres' transport requires the 'pg' package — run `npm install` " +

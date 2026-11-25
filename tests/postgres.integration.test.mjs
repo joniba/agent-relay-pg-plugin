@@ -375,7 +375,11 @@ test("a stale session that resumes re-registers (no resurrected duplicate alias)
   // candidate, so there's exactly one live "gull" (b's).
   const a = makeTransport({ staleMs: 500, heartbeatIntervalMs: 120, pollIntervalMs: 120 });
   const b = makeTransport({ staleMs: 500, heartbeatIntervalMs: 120, pollIntervalMs: 120 });
-  await a.init(ctx("rs-a", "x"));
+  const registrations = [];
+  await a.init({
+    ...ctx("rs-a", "x"),
+    onRegistered: (self) => registrations.push(self.name),
+  });
   await b.init(ctx("rs-b", "x"));
   const idA = ident("rs-a", "gull", ["gull", "pebble", "clove"]);
   await a.register(idA);
@@ -401,6 +405,7 @@ test("a stale session that resumes re-registers (no resurrected duplicate alias)
     roster.some((r) => r.id === "rs-a" && r.name !== "gull"),
     "a is live again under a DIFFERENT alias",
   );
+  assert.deepEqual(registrations, ["gull", idA.name], "notify the host after alias re-acquisition");
   await a.stop();
   await b.stop();
 });
